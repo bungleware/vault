@@ -221,6 +221,21 @@ func (h *InstanceHandler) sendExportProgress(userID int, current, total int, fil
 	})
 }
 
+func (h *InstanceHandler) sendImportProgress(userID int, stage string, current, total int, filename string) {
+	if h.wsHub == nil {
+		return
+	}
+	h.wsHub.SendToUser(int64(userID), WSMessage{
+		Type: "import_progress",
+		Payload: map[string]interface{}{
+			"stage":    stage,
+			"current":  current,
+			"total":    total,
+			"filename": filename,
+		},
+	})
+}
+
 // ImportInstance replaces data with uploaded backup
 func (h *InstanceHandler) ImportInstance(w http.ResponseWriter, r *http.Request) error {
 	userID, err := httputil.RequireUserID(r)
@@ -235,7 +250,7 @@ func (h *InstanceHandler) ImportInstance(w http.ResponseWriter, r *http.Request)
 		return apperr.NewForbidden("admin access required")
 	}
 
-	if err := r.ParseMultipartForm(10 * 1024 * 1024 * 1024); err != nil { // 10GB max
+	if err := r.ParseMultipartForm(32 << 20); err != nil { // 32MB memory, rest spills to disk
 		return apperr.NewBadRequest("failed to parse form")
 	}
 
@@ -244,6 +259,8 @@ func (h *InstanceHandler) ImportInstance(w http.ResponseWriter, r *http.Request)
 		return apperr.NewBadRequest("no backup file provided")
 	}
 	defer file.Close()
+
+	h.sendImportProgress(userID, "uploading", 0, 0, "")
 
 	tmpZip, err := os.CreateTemp("", "vault-import-*.zip")
 	if err != nil {
@@ -256,12 +273,15 @@ func (h *InstanceHandler) ImportInstance(w http.ResponseWriter, r *http.Request)
 	}
 	tmpZip.Close()
 
+	h.sendImportProgress(userID, "extracting", 0, 0, "")
+
 	zr, err := zip.OpenReader(tmpZip.Name())
 	if err != nil {
 		return apperr.NewBadRequest("invalid ZIP file")
 	}
 	defer zr.Close()
 
+	totalFiles := len(zr.File)
 	hasManifest := false
 	hasDB := false
 	tmpExtractDir, err := os.MkdirTemp("", "vault-extract-*")
@@ -270,7 +290,7 @@ func (h *InstanceHandler) ImportInstance(w http.ResponseWriter, r *http.Request)
 	}
 	defer os.RemoveAll(tmpExtractDir)
 
-	for _, f := range zr.File {
+	for i, f := range zr.File {
 		if f.Name == "manifest.json" {
 			hasManifest = true
 		}
@@ -281,11 +301,14 @@ func (h *InstanceHandler) ImportInstance(w http.ResponseWriter, r *http.Request)
 		if err := h.extractZipFile(f, tmpExtractDir); err != nil {
 			return apperr.NewBadRequest("failed to extract backup")
 		}
+		h.sendImportProgress(userID, "extracting", i+1, totalFiles, f.Name)
 	}
 
 	if !hasManifest || !hasDB {
 		return apperr.NewBadRequest("invalid backup: missing manifest or database")
 	}
+
+	h.sendImportProgress(userID, "replacing", 0, 0, "")
 
 	if err := h.db.ForceCheckpoint(); err != nil {
 		return apperr.NewInternal("failed to prepare current database", err)
@@ -419,14 +442,22 @@ func (h *InstanceHandler) ResetInstance(w http.ResponseWriter, r *http.Request) 
 			return apperr.NewInternal("failed to hash password", err)
 		}
 
-		if _, err := h.db.Queries.CreateUser(ctx, sqlc.CreateUserParams{
+		newUser, err := h.db.Queries.CreateUser(ctx, sqlc.CreateUserParams{
 			Username:     req.NewAdmin.Username,
 			Email:        req.NewAdmin.Email,
 			PasswordHash: passwordHash,
 			IsAdmin:      true,
 			IsOwner:      true,
-		}); err != nil {
+		})
+		if err != nil {
 			return apperr.NewInternal("failed to create admin user", err)
+		}
+
+		if err := h.db.Queries.CreateUserPreferences(ctx, sqlc.CreateUserPreferencesParams{
+			UserID:         newUser.ID,
+			DefaultQuality: "lossy",
+		}); err != nil {
+			return apperr.NewInternal("failed to create user preferences", err)
 		}
 	}
 

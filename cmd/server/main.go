@@ -250,10 +250,11 @@ func main() {
 	frontendHandler := serveFrontend()
 
 	// Create rate limiters for public endpoints
-	authRL := middleware.NewIPRateLimiter(5, 10)    // Auth endpoints: 5 req/min, burst 10
-	tokenRL := middleware.NewIPRateLimiter(10, 15)  // Token validation: 10 req/min, burst 15
-	publicRL := middleware.NewIPRateLimiter(30, 40) // Public info: 30 req/min, burst 40
-	shareRL := middleware.NewIPRateLimiter(60, 80)  // Share access: 60 req/min, burst 80
+	authRL := middleware.NewIPRateLimiter(5, 10)      // Auth endpoints: 5 req/min, burst 10
+	refreshRL := middleware.NewIPRateLimiter(20, 30)  // Token refresh: 20 req/min, burst 30
+	tokenRL := middleware.NewIPRateLimiter(10, 15)    // Token validation: 10 req/min, burst 15
+	publicRL := middleware.NewIPRateLimiter(30, 40)   // Public info: 30 req/min, burst 40
+	shareRL := middleware.NewIPRateLimiter(60, 80)    // Share access: 60 req/min, burst 80
 
 	// Public endpoints with rate limiting
 	mux.HandleFunc("GET /api/auth/check-users", publicRL.RateLimit(httputil.Wrap(authHandler.CheckUsersExists)))
@@ -263,7 +264,7 @@ func main() {
 	mux.HandleFunc("POST /api/auth/reset-password", authRL.RateLimit(httputil.Wrap(authHandler.ResetPassword)))
 	mux.HandleFunc("GET /api/auth/validate-reset-token", tokenRL.RateLimit(httputil.Wrap(authHandler.ValidateResetToken)))
 	mux.HandleFunc("POST /api/auth/login", authRL.RateLimit(httputil.Wrap(authHandler.Login)))
-	mux.HandleFunc("POST /api/auth/refresh", authRL.RateLimit(httputil.Wrap(authHandler.Refresh)))
+	mux.HandleFunc("POST /api/auth/refresh", refreshRL.RateLimit(httputil.Wrap(authHandler.Refresh)))
 	mux.HandleFunc("GET /api/share/{token}", shareRL.RateLimit(httputil.Wrap(sharingHandler.ValidateShareToken)))
 	mux.HandleFunc("GET /api/share/{token}/stream", shareRL.RateLimit(httputil.Wrap(sharingHandler.StreamSharedTrack)))
 	mux.HandleFunc("GET /api/share/{token}/stream/{trackId}", shareRL.RateLimit(httputil.Wrap(sharingHandler.StreamSharedProjectTrack)))

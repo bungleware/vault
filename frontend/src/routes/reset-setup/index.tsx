@@ -289,7 +289,7 @@ function ResetSetupPage() {
                     handleSubmit();
                   }
                 }}
-                className="border-[#353333]/50 text-white text-lg md:text-lg placeholder:text-white/80 h-12 rounded-2xl px-5"
+                className="border-[#353333]/50 text-white text-lg md:text-lg placeholder:text-white/40 h-12 rounded-2xl px-5"
                 style={{
                   background:
                     "linear-gradient(0deg, #1D1D1D 0%, rgba(40, 40, 40, 0.22) 100%)",
@@ -321,7 +321,7 @@ function ResetSetupPage() {
                     handleSubmit();
                   }
                 }}
-                className="border-[#353333]/50 text-white text-lg md:text-lg placeholder:text-white/80 h-12 rounded-2xl px-5"
+                className="border-[#353333]/50 text-white text-lg md:text-lg placeholder:text-white/40 h-12 rounded-2xl px-5"
                 style={{
                   background:
                     "linear-gradient(0deg, #1D1D1D 0%, rgba(40, 40, 40, 0.22) 100%)",
@@ -340,7 +340,7 @@ function ResetSetupPage() {
               <Input
                 id="password"
                 type="password"
-                placeholder="••••••••"
+                placeholder=""
                 value={password}
                 onChange={(e) => {
                   setPassword(e.target.value);
@@ -353,7 +353,7 @@ function ResetSetupPage() {
                     handleSubmit();
                   }
                 }}
-                className="border-[#353333]/50 text-white text-lg md:text-lg placeholder:text-white/80 h-12 rounded-2xl px-5"
+                className="border-[#353333]/50 text-white text-lg md:text-lg placeholder:text-white/40 h-12 rounded-2xl px-5"
                 style={{
                   background:
                     "linear-gradient(0deg, #1D1D1D 0%, rgba(40, 40, 40, 0.22) 100%)",

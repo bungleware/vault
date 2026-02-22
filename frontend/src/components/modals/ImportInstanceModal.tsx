@@ -3,11 +3,35 @@ import { Button } from "@/components/ui/button";
 import BaseModal from "./BaseModal";
 import ModalIcon from "./ModalIcon";
 import { importInstance } from "@/api/instance";
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
+import { AnimatePresence, motion } from "motion/react";
+import { onWSMessage, offWSMessage } from "@/hooks/useWebSocket";
+
+interface ImportProgress {
+  stage: string;
+  current: number;
+  total: number;
+  filename: string;
+}
 
 interface ImportInstanceModalProps {
   isOpen: boolean;
   onClose: () => void;
+}
+
+const spring = { type: "spring" as const, bounce: 0, duration: 0.4 };
+
+function stageLabel(stage: string): string {
+  switch (stage) {
+    case "uploading":
+      return "Uploading backup...";
+    case "extracting":
+      return "Extracting files...";
+    case "replacing":
+      return "Replacing data...";
+    default:
+      return "Processing...";
+  }
 }
 
 export default function ImportInstanceModal({
@@ -18,7 +42,21 @@ export default function ImportInstanceModal({
   const [isConfirmed, setIsConfirmed] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [progress, setProgress] = useState<ImportProgress | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!isImporting) return;
+
+    const listener = (message: { type: string; payload: unknown }) => {
+      if (message.type === "import_progress") {
+        setProgress(message.payload as ImportProgress);
+      }
+    };
+
+    onWSMessage(listener);
+    return () => offWSMessage(listener);
+  }, [isImporting]);
 
   const handleFileSelect = (file: File) => {
     if (file.name.endsWith(".zip")) {
@@ -56,6 +94,8 @@ export default function ImportInstanceModal({
 
     try {
       setIsImporting(true);
+      setProgress(null);
+      setError(null);
       await importInstance(selectedFile);
 
       window.location.href = "/";
@@ -65,13 +105,24 @@ export default function ImportInstanceModal({
       setError(message);
     } finally {
       setIsImporting(false);
+      setProgress(null);
     }
   };
 
   const isImportDisabled = !selectedFile || !isConfirmed || isImporting;
 
+  const pct =
+    progress && progress.total > 0
+      ? Math.round((progress.current / progress.total) * 100)
+      : 0;
+
   return (
-    <BaseModal isOpen={isOpen} onClose={onClose} disableClose={isImporting} maxWidth="lg">
+    <BaseModal
+      isOpen={isOpen}
+      onClose={onClose}
+      disableClose={isImporting}
+      maxWidth="lg"
+    >
       <div className="p-6 md:p-8">
         <ModalIcon icon={AlertTriangle} variant="destructive" />
 
@@ -96,10 +147,10 @@ export default function ImportInstanceModal({
         </div>
 
         <div
-          onClick={() => fileInputRef.current?.click()}
+          onClick={() => !isImporting && fileInputRef.current?.click()}
           onDragOver={handleDragOver}
           onDrop={handleDrop}
-          className="border-2 border-dashed border-[#353333] rounded-lg p-8 mb-6 cursor-pointer hover:border-[#454545] transition-colors bg-[#191919]"
+          className={`border-2 border-dashed border-[#353333] rounded-lg p-8 mb-6 transition-colors bg-[#191919] ${isImporting ? "opacity-50" : "cursor-pointer hover:border-[#454545]"}`}
         >
           <input
             ref={fileInputRef}
@@ -107,6 +158,7 @@ export default function ImportInstanceModal({
             accept=".zip"
             onChange={handleFileInputChange}
             className="hidden"
+            disabled={isImporting}
           />
 
           <div className="flex flex-col items-center justify-center">
@@ -122,24 +174,75 @@ export default function ImportInstanceModal({
           </div>
         </div>
 
+        {/* Progress bar */}
+        <AnimatePresence initial={false}>
+          {isImporting && (
+            <motion.div
+              key="import-progress"
+              initial={{ opacity: 0, height: 0, filter: "blur(4px)" }}
+              animate={{ opacity: 1, height: "auto", filter: "blur(0px)" }}
+              exit={{ opacity: 0, height: 0, filter: "blur(4px)" }}
+              transition={spring}
+              className="overflow-hidden"
+            >
+              <div className="mb-6 space-y-2">
+                <div className="flex justify-between text-xs text-muted-foreground">
+                  <span>
+                    {progress ? stageLabel(progress.stage) : "Preparing..."}
+                  </span>
+                  {progress && progress.total > 0 && (
+                    <span>
+                      {progress.current} / {progress.total}
+                    </span>
+                  )}
+                </div>
+                <div className="w-full h-2 bg-zinc-800 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-red-500 rounded-full transition-all duration-150"
+                    style={{
+                      width:
+                        progress && progress.total > 0 ? `${pct}%` : undefined,
+                    }}
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground truncate h-4">
+                  {progress?.filename ?? "\u00A0"}
+                </p>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         {error && (
           <p className="text-sm text-[#ff5656] text-center mb-4 bg-[#2a1a1a] p-3 rounded">
             {error}
           </p>
         )}
 
-        <label className="flex items-center justify-center gap-3 mb-6 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={isConfirmed}
-            onChange={(e) => setIsConfirmed(e.target.checked)}
-            className="w-4 h-4 rounded"
-            disabled={isImporting}
-          />
-          <span className="text-sm text-[#848484]">
-            I understand this will replace all current data
-          </span>
-        </label>
+        <AnimatePresence initial={false}>
+          {!isImporting && (
+            <motion.div
+              key="confirm-checkbox"
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: "auto" }}
+              exit={{ opacity: 0, height: 0 }}
+              transition={spring}
+              className="overflow-hidden"
+            >
+              <label className="flex items-center justify-center gap-3 mb-6 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={isConfirmed}
+                  onChange={(e) => setIsConfirmed(e.target.checked)}
+                  className="w-4 h-4 rounded"
+                />
+                <span className="text-sm text-[#848484]">
+                  I understand this will replace all current data
+                </span>
+              </label>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         <div className="flex flex-col gap-3">
           <Button
