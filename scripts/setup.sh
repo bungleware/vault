@@ -1,53 +1,40 @@
 #!/bin/bash
-
 set -e
 
-BOLD='\033[1m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
+BOLD='\033[1m' GREEN='\033[0;32m' YELLOW='\033[1;33m' RED='\033[0;31m' DIM='\033[2m' NC='\033[0m'
+
+fail() { echo -e "\n${RED}$1${NC}\n"; exit 1; }
+step() { echo -e "  ${DIM}→${NC} $1"; }
+ok()   { echo -e "  ${GREEN}✓${NC} $1"; }
 
 INSTALL_DIR="${1:-vault}"
+REPO="bungleware/vault"
 
 echo ""
-echo -e "${BOLD}{ vault } setup${NC}"
+echo -e "${BOLD}  vault${NC} setup"
 echo ""
 
-# Check Docker
-if ! command -v docker &>/dev/null; then
-    echo -e "${RED}Docker is not installed. Please install it first: https://docs.docker.com/get-docker/${NC}"
-    exit 1
-fi
+# Prerequisites
+command -v docker &>/dev/null || fail "Docker is not installed. https://docs.docker.com/get-docker/"
+docker compose version &>/dev/null || fail "Docker Compose v2 is required. Please update Docker."
 
-if ! docker compose version &>/dev/null; then
-    echo -e "${RED}Docker Compose v2 is required. Please update Docker.${NC}"
-    exit 1
-fi
+# Install
+mkdir -p "$INSTALL_DIR" && cd "$INSTALL_DIR"
+step "Installing to $(pwd)"
 
-mkdir -p "$INSTALL_DIR"
-cd "$INSTALL_DIR"
+step "Downloading docker-compose.yml"
+curl -fsSL "https://raw.githubusercontent.com/$REPO/main/docker-compose.yml" -o docker-compose.yml
+ok "docker-compose.yml"
 
-echo "Installing into: $(pwd)"
-echo ""
-
-# Download docker-compose.yml
-echo "Downloading docker-compose.yml..."
-curl -fsSL "https://raw.githubusercontent.com/bungleware/vault/main/docker-compose.yml" -o docker-compose.yml
-
-# Generate .env
-echo "Generating .env..."
-JWT_SECRET=$(openssl rand -base64 32)
-SIGNED_URL_SECRET=$(openssl rand -base64 32)
-TOKEN_PEPPER=$(openssl rand -base64 32)
-
+# Generate .env with secrets inline — no sed replacement needed
+step "Generating .env"
 cat > .env <<EOF
 PORT=8080
 DATA_DIR=/app/data
 
-JWT_SECRET=${JWT_SECRET}
-SIGNED_URL_SECRET=${SIGNED_URL_SECRET}
-TOKEN_PEPPER=${TOKEN_PEPPER}
+JWT_SECRET=$(openssl rand -base64 32)
+SIGNED_URL_SECRET=$(openssl rand -base64 32)
+TOKEN_PEPPER=$(openssl rand -base64 32)
 
 ACCESS_TOKEN_TTL=15m
 REFRESH_TOKEN_TTL=720h
@@ -56,26 +43,24 @@ SIGNED_URL_TTL=5m
 COOKIE_SECURE=true
 COOKIE_SAMESITE=Lax
 EOF
+ok ".env with generated secrets"
 
 echo ""
-echo -e "${YELLOW}Review .env before starting if you need to change the port or cookie settings.${NC}"
+echo -e "  ${YELLOW}Review $(pwd)/.env before starting.${NC}"
 echo ""
 
-read -rp "Start vault now? [Y/n] " answer
-answer="${answer:-Y}"
-
-if [[ "$answer" =~ ^[Yy]$ ]]; then
+read -rp "  Start vault now? [Y/n] " answer
+if [[ "${answer:-Y}" =~ ^[Yy]$ ]]; then
     docker compose up -d
     echo ""
-    echo -e "${GREEN}${BOLD}Done.${NC} Vault is running at http://localhost:8080"
+    echo -e "  ${GREEN}${BOLD}Vault is running at http://localhost:8080${NC}"
 else
     echo ""
-    echo "Run 'docker compose up -d' inside $(pwd) when ready."
+    echo -e "  Run ${BOLD}docker compose up -d${NC} inside $(pwd) when ready."
 fi
 
 echo ""
-echo "Useful commands:"
-echo "  Logs:    docker compose logs -f"
-echo "  Stop:    docker compose down"
-echo "  Update:  docker compose pull && docker compose up -d"
+echo -e "  ${DIM}Logs:   docker compose logs -f${NC}"
+echo -e "  ${DIM}Stop:   docker compose down${NC}"
+echo -e "  ${DIM}Update: docker compose pull && docker compose up -d${NC}"
 echo ""

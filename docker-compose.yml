@@ -7,10 +7,16 @@ services:
     ports:
       - "8080:8080"
     environment:
-      - PORT=8080
-      - DATA_DIR=/app/data
-      - JWT_SECRET=change-this-secret-key
-      - SIGNED_URL_SECRET=change-this-signed-url-secret
+      - PORT=${PORT:-8080}
+      - DATA_DIR=${DATA_DIR:-/app/data}
+      - JWT_SECRET=${JWT_SECRET}
+      - SIGNED_URL_SECRET=${SIGNED_URL_SECRET}
+      - TOKEN_PEPPER=${TOKEN_PEPPER}
+      - ACCESS_TOKEN_TTL=${ACCESS_TOKEN_TTL:-15m}
+      - REFRESH_TOKEN_TTL=${REFRESH_TOKEN_TTL:-720h}
+      - SIGNED_URL_TTL=${SIGNED_URL_TTL:-5m}
+      - COOKIE_SECURE=${COOKIE_SECURE:-true}
+      - COOKIE_SAMESITE=${COOKIE_SAMESITE:-Lax}
     volumes:
       - ./data:/app/data
     healthcheck:

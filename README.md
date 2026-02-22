@@ -33,7 +33,7 @@ Requires Docker.
 **Automated**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bungleware/vault/main/scripts/setup.sh | bash
+bash <(curl -fsSL https://raw.githubusercontent.com/bungleware/vault/main/scripts/setup.sh)
 ```
 
 This downloads `docker-compose.yml`, generates an `.env` with random secrets, and starts the container. An optional directory name can be passed as an argument (default: `vault`).
