@@ -51,7 +51,7 @@ export function useFileDragUpload({
       setDropTargetTrackId(null);
 
       const files = Array.from(e.dataTransfer.files).filter((file) =>
-        file.type.startsWith("audio/"),
+        file.type.startsWith("audio/") || file.type.startsWith("video/"),
       );
 
       if (files.length > 0) {
@@ -90,7 +90,7 @@ export function useFileDragUpload({
       setDropTargetTrackId(null);
 
       const files = Array.from(e.dataTransfer.files).filter((file) =>
-        file.type.startsWith("audio/"),
+        file.type.startsWith("audio/") || file.type.startsWith("video/"),
       );
 
       if (files.length > 0) {

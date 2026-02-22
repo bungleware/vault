@@ -350,6 +350,11 @@ func (h *VersionsHandler) UploadVersion(w http.ResponseWriter, r *http.Request) 
 	}
 	defer file.Close()
 
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+	if !transcoding.IsAllowedUploadExtension(ext) {
+		return apperr.NewBadRequest("unsupported file format")
+	}
+
 	ctx := r.Context()
 
 	publicID := r.PathValue("track_id")
@@ -424,6 +429,18 @@ func (h *VersionsHandler) UploadVersion(w http.ResponseWriter, r *http.Request) 
 	})
 	if err != nil {
 		return apperr.NewInternal("failed to save file", err)
+	}
+
+	if transcoding.IsVideoExtension(ext) {
+		wavPath, err := transcoding.ExtractAudioToWAV(saveResult.Path)
+		if err != nil {
+			return apperr.NewInternal("failed to extract audio from video", err)
+		}
+		saveResult.Path = wavPath
+		saveResult.Format = "wav"
+		if fi, err := os.Stat(wavPath); err == nil {
+			saveResult.Size = fi.Size()
+		}
 	}
 
 	metadata, err := transcoding.ExtractMetadata(saveResult.Path)

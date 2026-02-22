@@ -49,6 +49,11 @@ step "Downloading docker-compose.yml"
 curl -fsSL "https://raw.githubusercontent.com/$REPO/main/docker-compose.yml" -o docker-compose.yml
 ok "docker-compose.yml"
 
+step "Downloading update.sh"
+curl -fsSL "https://raw.githubusercontent.com/$REPO/main/scripts/update.sh" -o update.sh
+chmod +x update.sh
+ok "update.sh"
+
 echo ""
 echo -e "  ${BOLD}Configuration${NC} ${DIM}(press Enter to accept defaults)${NC}"
 echo ""
@@ -58,12 +63,22 @@ DEFAULT_PORT=$(next_available_port 8080)
 if [ "$DEFAULT_PORT" != "8080" ]; then
     echo -e "  ${YELLOW}Port 8080 is in use.${NC}"
 fi
-ask "Port" "$DEFAULT_PORT"
-PORT="$REPLY"
+while true; do
+    ask "Port" "$DEFAULT_PORT"
+    PORT="$REPLY"
+    if [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ]; then
+        break
+    fi
+    echo -e "  ${RED}Invalid port. Enter a number between 1 and 65535.${NC}"
+done
 
 # --- Data directory ---
-ask "Data directory (host path)" "./data"
-DATA_DIR_HOST="$REPLY"
+while true; do
+    ask "Data directory (host path)" "./data"
+    DATA_DIR_HOST="$REPLY"
+    [ -n "$DATA_DIR_HOST" ] && break
+    echo -e "  ${RED}Data directory cannot be empty.${NC}"
+done
 
 # --- Secrets ---
 echo -ne "  ${BOLD}Auto-generate secrets?${NC} ${DIM}[Y/n]${NC}: "

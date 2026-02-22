@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -33,6 +34,11 @@ func (h *TracksHandler) UploadTrack(w http.ResponseWriter, r *http.Request) erro
 		return apperr.NewBadRequest("no file provided")
 	}
 	defer file.Close()
+
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+	if !transcoding.IsAllowedUploadExtension(ext) {
+		return apperr.NewBadRequest("unsupported file format")
+	}
 
 	projectIDStr := r.FormValue("project_id")
 	if projectIDStr == "" {
@@ -161,6 +167,18 @@ func (h *TracksHandler) UploadTrack(w http.ResponseWriter, r *http.Request) erro
 	})
 	if err != nil {
 		return apperr.NewInternal("failed to save file", err)
+	}
+
+	if transcoding.IsVideoExtension(ext) {
+		wavPath, err := transcoding.ExtractAudioToWAV(saveResult.Path)
+		if err != nil {
+			return apperr.NewInternal("failed to extract audio from video", err)
+		}
+		saveResult.Path = wavPath
+		saveResult.Format = "wav"
+		if fi, err := os.Stat(wavPath); err == nil {
+			saveResult.Size = fi.Size()
+		}
 	}
 
 	metadata, err := transcoding.ExtractMetadata(saveResult.Path)

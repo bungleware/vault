@@ -1334,7 +1334,7 @@ export default function TrackVersionsModal({
                     <input
                       ref={fileInputRef}
                       type="file"
-                      accept="audio/*"
+                      accept="audio/*,video/mp4,video/quicktime,video/x-matroska,video/x-msvideo,video/webm"
                       className="hidden"
                       onChange={(e) => handleAddVersion(e.target.files)}
                     />
