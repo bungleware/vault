@@ -1,0 +1,197 @@
+@import "@fontsource/ibm-plex-mono/300.css";
+@import "@fontsource/ibm-plex-mono/300-italic.css";
+
+@import "tailwindcss";
+
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@font-face {
+  font-family: "Overused Grotesk";
+  src: url("../fonts/OverusedGroteskRoman-VF.ttf") format("woff2-variations");
+  font-weight: 100 200 300 400 500 600 700 800 900;
+}
+
+body {
+  @apply m-0;
+  font-family: "Overused Grotesk", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: var(--bg-0);
+}
+
+code,
+[style*="IBM Plex Mono"] {
+  font-family: "IBM Plex Mono", monospace;
+  font-weight: 300;
+}
+
+/* Design tokens from Figma palette */
+/* Base colors */
+:root {
+  --bg-0: #181818;
+  --bg-1: #191919;
+  --bg-2: #201f1f;
+  --bg-3: #232323;
+  --bg-4: #262626;
+  --text-0: #ffffff;
+  --text-1: #919191;
+  --text-2: #7c7c7c;
+  --muted-0: #848484;
+  --muted-1: #7b7b7b;
+  --muted-2: #383838;
+  --border-0: #353333;
+
+  /* Accents */
+  --accent-blue: #0099bb; /* #09B spec */
+  --accent-green: #00ff6a;
+  --success-0: #23bd63; /* switch track */
+  --success-1: #044221; /* good status bg */
+  --danger-0: #fe9797; /* danger text */
+  --danger-1: #b93e3e; /* danger bg */
+
+  /* Components */
+  --card-border-radius: 24px;
+  --card-border: var(--border-0);
+  --card-gradient-from: #262626;
+  --card-gradient-to: #201f1f;
+
+  --inner-card-border-radius: 21px;
+  --inner-card-bg: var(--bg-1);
+
+  --button-radius: 16px;
+  --button-border: var(--border-0);
+  --button-gradient-from: #353333;
+  --button-gradient-to: #1d1d1d;
+
+  --button-hot-border: #9a9a9a;
+  --button-gradient-hot-from: #f0e1e1;
+  --button-gradient-hot-to: #7d7c7c;
+}
+
+.dark {
+  --bg-0: #181818;
+  --bg-1: #191919;
+  --bg-2: #201f1f;
+  --bg-3: #232323;
+  --bg-4: #262626;
+  --text-0: #ffffff;
+  --text-1: #919191;
+  --text-2: #7c7c7c;
+  --muted-0: #848484;
+  --muted-1: #7b7b7b;
+  --muted-2: #383838;
+  --border-0: #353333;
+
+  --accent-blue: #0099bb;
+  --accent-green: #00ff6a;
+  --success-0: #23bd63;
+  --success-1: #044221;
+  --danger-0: #fe9797;
+  --danger-1: #5a1a1a;
+
+  --card-border-radius: 24px;
+  --card-border: var(--border-0);
+  --card-gradient-from: #262626;
+  --card-gradient-to: #201f1f;
+
+  --inner-card-border-radius: 21px;
+  --inner-card-bg: var(--bg-1);
+
+  --button-radius: 16px;
+  --button-border: var(--border-0);
+  --button-gradient-from: #353333;
+  --button-gradient-to: #1d1d1d;
+}
+
+@theme inline {
+  /* Map to Tailwind tokens */
+  --color-background: var(--bg-0);
+  --color-foreground: var(--text-0);
+  --color-muted: var(--muted-2);
+  --color-muted-foreground: var(--text-2);
+  --color-border: var(--border-0);
+  --color-input: color-mix(in oklab, var(--bg-1) 80%, white 0%);
+  --color-ring: var(--accent-blue);
+
+  --color-primary: var(--bg-3);
+  --color-primary-foreground: var(--text-0);
+  --color-secondary: var(--muted-2);
+  --color-secondary-foreground: var(--text-0);
+  --color-accent: var(--bg-2);
+  --color-accent-foreground: var(--text-0);
+  --color-popover: var(--bg-2);
+  --color-popover-foreground: var(--text-0);
+  --color-card: var(--bg-2);
+  --color-card-foreground: var(--text-0);
+
+  --color-destructive: var(--danger-1);
+  --color-destructive-foreground: var(--danger-0);
+}
+
+/* Helpers for gradients and component shapes */
+.card-surface {
+  border-radius: var(--card-border-radius);
+  border: 1px solid var(--card-border);
+  background: linear-gradient(
+    180deg,
+    var(--card-gradient-from) 0%,
+    var(--card-gradient-to) 100%
+  );
+}
+
+.card-inner {
+  border-radius: var(--inner-card-border-radius);
+  border: 1px solid var(--card-border);
+  background: var(--inner-card-bg);
+}
+
+.btn-surface {
+  border-radius: var(--button-radius);
+  border: 1px solid var(--button-border);
+  background: linear-gradient(
+    180deg,
+    var(--button-gradient-from) 0%,
+    var(--button-gradient-to) 100%
+  );
+}
+
+.status-good-bg {
+  border-radius: 28px;
+  background: var(--success-1);
+}
+
+.status-good-fg {
+  color: var(--accent-green);
+}
+
+.status-danger-bg {
+  background: var(--danger-1);
+}
+
+.status-danger-fg {
+  color: var(--danger-0);
+}
+
+/* @layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+} */
+
+@keyframes scroll-text {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(calc(-1 * var(--scroll-offset, 50%)));
+  }
+}
+
+.animate-scroll-text {
+  animation: scroll-text var(--scroll-duration, 12s) linear infinite;
+}
