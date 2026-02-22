@@ -1,21 +1,17 @@
-# Git
 .git
 .gitignore
 .gitattributes
 
-# Documentation
 *.md
 docs/
 README.md
 
-# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# Build artifacts
 bin/
 dist/
 *.exe
@@ -23,22 +19,18 @@ dist/
 *.so
 *.dylib
 
-# Test files
 *_test.go
 test/
 tests/
 
-# Development files
 .env
 .env.local
 .env.*.local
 
-# Node modules (will be installed in container)
 frontend/node_modules/
 frontend/.next/
 frontend/dist/
 
-# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -49,35 +41,27 @@ venv/
 ENV/
 .venv
 
-# Logs
 *.log
 logs/
 service.log
 
-# Database files (will be in volume)
 data/*.db
 data/*.db-shm
 data/*.db-wal
 
-# Temporary files
 tmp/
 temp/
 *.tmp
 
-# OS files
 .DS_Store
 Thumbs.db
 
-# Docker
 Dockerfile*
 docker-compose*.yml
 .dockerignore
 
-# Scripts (not needed in container)
 scripts/
 Makefile
 
-# Lock files (will be generated)
-# Note: go.sum should be included for reproducible builds
 frontend/package-lock.json
 
