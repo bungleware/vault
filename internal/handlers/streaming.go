@@ -8,19 +8,19 @@ import (
 	"strconv"
 
 	"bungleware/vault/internal/apperr"
-	"bungleware/vault/internal/db"
 	sqlc "bungleware/vault/internal/db/sqlc"
 	"bungleware/vault/internal/handlers/tracks"
 	"bungleware/vault/internal/httputil"
 	"bungleware/vault/internal/middleware"
+	"bungleware/vault/internal/service"
 )
 
 type StreamingHandler struct {
-	db *db.DB
+	tracksService service.TracksService
 }
 
-func NewStreamingHandler(database *db.DB) *StreamingHandler {
-	return &StreamingHandler{db: database}
+func NewStreamingHandler(tracksService service.TracksService) *StreamingHandler {
+	return &StreamingHandler{tracksService: tracksService}
 }
 
 func (h *StreamingHandler) StreamTrack(w http.ResponseWriter, r *http.Request) error {
@@ -43,8 +43,7 @@ func (h *StreamingHandler) StreamTrack(w http.ResponseWriter, r *http.Request) e
 	publicID := r.PathValue("id")
 
 	var versionID *int64
-	versionIDStr := r.URL.Query().Get("version_id")
-	if versionIDStr != "" {
+	if versionIDStr := r.URL.Query().Get("version_id"); versionIDStr != "" {
 		vid, err := strconv.ParseInt(versionIDStr, 10, 64)
 		if err != nil {
 			return apperr.NewBadRequest("invalid version_id")
@@ -53,15 +52,14 @@ func (h *StreamingHandler) StreamTrack(w http.ResponseWriter, r *http.Request) e
 	}
 
 	requestedQuality := r.URL.Query().Get("quality")
-
 	ctx := r.Context()
 
-	track, err := h.db.Queries.GetTrackByPublicIDNoFilter(ctx, publicID)
+	track, err := h.tracksService.GetTrackByPublicID(ctx, publicID)
 	if err := httputil.HandleDBError(err, "track not found", "failed to query track"); err != nil {
 		return err
 	}
 
-	access, err := tracks.CheckTrackAccess(ctx, h.db, track.ID, track.ProjectID, int64(userID))
+	access, err := tracks.CheckTrackAccess(ctx, h.tracksService, track.ID, track.ProjectID, int64(userID))
 	if err != nil {
 		return apperr.NewInternal("failed to check track access", err)
 	}
@@ -98,15 +96,15 @@ func (h *StreamingHandler) resolveQuality(ctx context.Context, userID, trackID i
 		}
 	}
 
-	track, err := h.db.GetTrackByID(ctx, trackID)
+	track, err := h.tracksService.GetTrackByID(ctx, trackID)
 	if err == nil {
-		project, err := h.db.GetProjectByID(ctx, track.ProjectID)
+		project, err := h.tracksService.GetProjectByID(ctx, track.ProjectID)
 		if err == nil && project.QualityOverride.Valid {
 			return project.QualityOverride.String
 		}
 	}
 
-	prefs, err := h.db.GetUserPreferences(ctx, userID)
+	prefs, err := h.tracksService.GetUserPreferences(ctx, userID)
 	if err == nil {
 		return prefs.DefaultQuality
 	}
@@ -115,40 +113,33 @@ func (h *StreamingHandler) resolveQuality(ctx context.Context, userID, trackID i
 }
 
 func (h *StreamingHandler) findTrackFile(ctx context.Context, versionID int64, preferredQuality string) (*sqlc.TrackFile, error) {
-	file, err := h.getTrackFile(ctx, versionID, preferredQuality)
+	file, err := h.tracksService.GetCompletedTrackFile(ctx, versionID, preferredQuality)
 	if err == nil {
 		return &file, nil
 	}
 
 	if preferredQuality != "lossy" {
-		file, err = h.getTrackFile(ctx, versionID, "lossy")
+		file, err = h.tracksService.GetCompletedTrackFile(ctx, versionID, "lossy")
 		if err == nil {
 			return &file, nil
 		}
 	}
 
 	if preferredQuality != "source" {
-		file, err = h.getTrackFile(ctx, versionID, "source")
+		file, err = h.tracksService.GetCompletedTrackFile(ctx, versionID, "source")
 		if err == nil {
 			return &file, nil
 		}
 	}
 
 	if preferredQuality != "lossless" {
-		file, err = h.getTrackFile(ctx, versionID, "lossless")
+		file, err = h.tracksService.GetCompletedTrackFile(ctx, versionID, "lossless")
 		if err == nil {
 			return &file, nil
 		}
 	}
 
 	return nil, fmt.Errorf("no available file found")
-}
-
-func (h *StreamingHandler) getTrackFile(ctx context.Context, versionID int64, quality string) (sqlc.TrackFile, error) {
-	return h.db.GetCompletedTrackFile(ctx, sqlc.GetCompletedTrackFileParams{
-		VersionID: versionID,
-		Quality:   quality,
-	})
 }
 
 func (h *StreamingHandler) streamFile(w http.ResponseWriter, r *http.Request, file *sqlc.TrackFile) {
@@ -178,6 +169,5 @@ func (h *StreamingHandler) streamFile(w http.ResponseWriter, r *http.Request, fi
 	}
 
 	w.Header().Set("Content-Type", contentType)
-
 	http.ServeContent(w, r, file.FilePath, stat.ModTime(), f)
 }

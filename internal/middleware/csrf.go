@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"crypto/subtle"
 	"net/http"
 	"strings"
 
@@ -9,6 +10,7 @@ import (
 
 type CSRFMiddlewareConfig struct {
 	ExemptPaths []string
+	ExemptFuncs []func(r *http.Request) bool
 }
 
 func CSRFMiddleware(config CSRFMiddlewareConfig) func(http.Handler) http.Handler {
@@ -26,6 +28,13 @@ func CSRFMiddleware(config CSRFMiddlewareConfig) func(http.Handler) http.Handler
 				}
 			}
 
+			for _, fn := range config.ExemptFuncs {
+				if fn(r) {
+					next.ServeHTTP(w, r)
+					return
+				}
+			}
+
 			csrfCookie, err := r.Cookie(auth.CSRFCookieName)
 			if err != nil || csrfCookie.Value == "" {
 				http.Error(w, "missing csrf token", http.StatusForbidden)
@@ -33,7 +42,7 @@ func CSRFMiddleware(config CSRFMiddlewareConfig) func(http.Handler) http.Handler
 			}
 
 			csrfHeader := r.Header.Get("X-CSRF-Token")
-			if csrfHeader == "" || csrfHeader != csrfCookie.Value {
+			if csrfHeader == "" || subtle.ConstantTimeCompare([]byte(csrfHeader), []byte(csrfCookie.Value)) != 1 {
 				http.Error(w, "invalid csrf token", http.StatusForbidden)
 				return
 			}

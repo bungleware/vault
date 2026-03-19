@@ -1,28 +1,32 @@
 package sharing
 
 import (
-	"context"
-	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
+	"strings"
 
-	"bungleware/vault/internal/db"
-	sqlc "bungleware/vault/internal/db/sqlc"
+	"bungleware/vault/internal/apperr"
+	"bungleware/vault/internal/service"
 	"bungleware/vault/internal/storage"
-
-	"golang.org/x/crypto/bcrypt"
 )
 
 type SharingHandler struct {
-	db      *db.DB
+	svc     service.SharingService
 	storage storage.Storage
+	baseURL string
+	dataDir string
 }
 
-func NewSharingHandler(database *db.DB, storageAdapter storage.Storage) *SharingHandler {
-	return &SharingHandler{db: database, storage: storageAdapter}
+func NewSharingHandler(svc service.SharingService, storageAdapter storage.Storage, baseURL string, dataDir string) *SharingHandler {
+	return &SharingHandler{svc: svc, storage: storageAdapter, baseURL: baseURL, dataDir: dataDir}
 }
 
-func buildShareURL(r *http.Request, token string) string {
+func (h *SharingHandler) buildShareURL(r *http.Request, token string) string {
+	if h.baseURL != "" {
+		return fmt.Sprintf("%s/share/%s", strings.TrimRight(h.baseURL, "/"), token)
+	}
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
@@ -30,32 +34,49 @@ func buildShareURL(r *http.Request, token string) string {
 	return fmt.Sprintf("%s://%s/share/%s", scheme, r.Host, token)
 }
 
-func hashSharePassword(password *string) (sql.NullString, error) {
-	if password == nil || *password == "" {
-		return sql.NullString{Valid: false}, nil
+func (h *SharingHandler) buildShareCoverURL(r *http.Request, token string) string {
+	if h.baseURL != "" {
+		return fmt.Sprintf("%s/api/share/%s/cover", strings.TrimRight(h.baseURL, "/"), token)
 	}
-
-	hash, err := bcrypt.GenerateFromPassword([]byte(*password), bcrypt.DefaultCost)
-	if err != nil {
-		return sql.NullString{}, fmt.Errorf("failed to hash password: %w", err)
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
 	}
-
-	return sql.NullString{String: string(hash), Valid: true}, nil
+	return fmt.Sprintf("%s://%s/api/share/%s/cover", scheme, r.Host, token)
 }
 
-func (h *SharingHandler) canManageTrackShares(ctx context.Context, track sqlc.Track, userID int64) (bool, error) {
-	project, err := h.db.Queries.GetProjectByID(ctx, track.ProjectID)
-	if err == nil && project.UserID == userID {
-		return true, nil
+// validateFilePath ensures the path is within the data directory.
+func (h *SharingHandler) validateFilePath(filePath string) error {
+	cleanPath := filepath.Clean(filePath)
+	cleanDataDir := filepath.Clean(h.dataDir)
+	if !strings.HasPrefix(cleanPath, cleanDataDir+string(filepath.Separator)) {
+		return apperr.NewForbidden("invalid file path")
 	}
+	return nil
+}
 
-	share, err := h.db.Queries.GetUserProjectShare(ctx, sqlc.GetUserProjectShareParams{
-		ProjectID: track.ProjectID,
-		SharedTo:  userID,
-	})
-	if err == nil && share.CanEdit {
-		return true, nil
+// mapSharingErr maps service sentinel errors to HTTP errors for streaming/download handlers.
+// Note: ErrPasswordRequired/ErrInvalidPassword/ErrShareExpired/ErrAccessLimitReached map to Forbidden
+// in streaming/download context (not to a {valid:false} body — those are for the validate endpoint only).
+func mapSharingErr(err error) error {
+	switch {
+	case errors.Is(err, service.ErrNotFound):
+		return apperr.NewNotFound(err.Error())
+	case errors.Is(err, service.ErrForbidden):
+		return apperr.NewForbidden(err.Error())
+	case errors.Is(err, service.ErrBadRequest):
+		return apperr.NewBadRequest(err.Error())
+	case errors.Is(err, service.ErrShareExpired):
+		return apperr.NewForbidden("share token expired")
+	case errors.Is(err, service.ErrAccessLimitReached):
+		return apperr.NewForbidden("max access count reached")
+	case errors.Is(err, service.ErrDownloadNotAllowed):
+		return apperr.NewForbidden("downloads not allowed for this share")
+	case errors.Is(err, service.ErrPasswordRequired):
+		return apperr.NewUnauthorized("password required")
+	case errors.Is(err, service.ErrInvalidPassword):
+		return apperr.NewUnauthorized("invalid password")
+	default:
+		return apperr.NewInternal("internal error", err)
 	}
-
-	return false, nil
 }

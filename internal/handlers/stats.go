@@ -4,18 +4,18 @@ import (
 	"net/http"
 
 	"bungleware/vault/internal/apperr"
-	"bungleware/vault/internal/db"
 	"bungleware/vault/internal/httputil"
+	"bungleware/vault/internal/service"
 )
 
 type StatsHandler struct {
-	db        *db.DB
+	svc       service.StatsService
 	version   string
 	commitSHA string
 }
 
-func NewStatsHandler(database *db.DB, version, commitSHA string) *StatsHandler {
-	return &StatsHandler{db: database, version: version, commitSHA: commitSHA}
+func NewStatsHandler(svc service.StatsService, version, commitSHA string) *StatsHandler {
+	return &StatsHandler{svc: svc, version: version, commitSHA: commitSHA}
 }
 
 func (h *StatsHandler) GetStorageStats(w http.ResponseWriter, r *http.Request) error {
@@ -24,35 +24,41 @@ func (h *StatsHandler) GetStorageStats(w http.ResponseWriter, r *http.Request) e
 		return apperr.NewUnauthorized("unauthorized")
 	}
 
-	ctx := r.Context()
-
-	stats, err := h.db.GetStorageStatsByUser(ctx, int64(userID))
+	stats, err := h.svc.GetStorageStats(r.Context(), int64(userID))
 	if err != nil {
 		return apperr.NewInternal("failed to query storage stats", err)
 	}
 
-	totalSize, _ := stats.TotalSizeBytes.(int64)
-	sourceSize, _ := stats.SourceSizeBytes.(int64)
-	losslessSize, _ := stats.LosslessSizeBytes.(int64)
-	lossySize, _ := stats.LossySizeBytes.(int64)
-
-	response := StorageStatsResponse{
-		TotalSizeBytes:    totalSize,
-		SourceSizeBytes:   sourceSize,
-		LosslessSizeBytes: losslessSize,
-		LossySizeBytes:    lossySize,
+	return httputil.OKResult(w, StorageStatsResponse{
+		TotalSizeBytes:    stats.TotalSizeBytes,
+		SourceSizeBytes:   stats.SourceSizeBytes,
+		LosslessSizeBytes: stats.LosslessSizeBytes,
+		LossySizeBytes:    stats.LossySizeBytes,
 		FileCount:         stats.FileCount,
 		ProjectCount:      stats.ProjectCount,
 		TrackCount:        stats.TrackCount,
+	})
+}
+
+func (h *StatsHandler) GetGlobalStorageStats(w http.ResponseWriter, r *http.Request) error {
+	stats, err := h.svc.GetGlobalStorageStats(r.Context())
+	if err != nil {
+		return apperr.NewInternal("failed to query storage stats", err)
 	}
 
-	return httputil.OKResult(w, response)
+	return httputil.OKResult(w, StorageStatsResponse{
+		TotalSizeBytes:    stats.TotalSizeBytes,
+		SourceSizeBytes:   stats.SourceSizeBytes,
+		LosslessSizeBytes: stats.LosslessSizeBytes,
+		LossySizeBytes:    stats.LossySizeBytes,
+		FileCount:         stats.FileCount,
+		ProjectCount:      stats.ProjectCount,
+		TrackCount:        stats.TrackCount,
+	})
 }
 
 func (h *StatsHandler) GetInstanceInfo(w http.ResponseWriter, r *http.Request) error {
-	ctx := r.Context()
-
-	settings, err := h.db.GetInstanceSettings(ctx)
+	settings, err := h.svc.GetInstanceSettings(r.Context())
 	if err != nil {
 		return apperr.NewInternal("failed to get instance settings", err)
 	}
@@ -63,49 +69,16 @@ func (h *StatsHandler) GetInstanceInfo(w http.ResponseWriter, r *http.Request) e
 		createdAt = &formatted
 	}
 
-	response := InstanceInfoResponse{
+	return httputil.OKResult(w, InstanceInfoResponse{
 		Version:   h.version,
 		CommitSHA: h.commitSHA,
 		Name:      settings.Name,
 		CreatedAt: createdAt,
-	}
-
-	return httputil.OKResult(w, response)
+	})
 }
 
 func (h *StatsHandler) GetInstanceVersion(w http.ResponseWriter, r *http.Request) error {
-	response := InstanceVersionResponse{
-		Version:   h.version,
-		CommitSHA: h.commitSHA,
-	}
-
-	return httputil.OKResult(w, response)
-}
-
-func (h *StatsHandler) GetGlobalStorageStats(w http.ResponseWriter, r *http.Request) error {
-	ctx := r.Context()
-
-	stats, err := h.db.GetGlobalStorageStats(ctx)
-	if err != nil {
-		return apperr.NewInternal("failed to query storage stats", err)
-	}
-
-	totalSize, _ := stats.TotalSizeBytes.(int64)
-	sourceSize, _ := stats.SourceSizeBytes.(int64)
-	losslessSize, _ := stats.LosslessSizeBytes.(int64)
-	lossySize, _ := stats.LossySizeBytes.(int64)
-
-	response := StorageStatsResponse{
-		TotalSizeBytes:    totalSize,
-		SourceSizeBytes:   sourceSize,
-		LosslessSizeBytes: losslessSize,
-		LossySizeBytes:    lossySize,
-		FileCount:         stats.FileCount,
-		ProjectCount:      stats.ProjectCount,
-		TrackCount:        stats.TrackCount,
-	}
-
-	return httputil.OKResult(w, response)
+	return httputil.OKResult(w, InstanceVersionResponse{Version: h.version})
 }
 
 func (h *StatsHandler) UpdateInstanceName(w http.ResponseWriter, r *http.Request) error {
@@ -118,9 +91,7 @@ func (h *StatsHandler) UpdateInstanceName(w http.ResponseWriter, r *http.Request
 		return apperr.NewBadRequest("instance name is required")
 	}
 
-	ctx := r.Context()
-
-	settings, err := h.db.UpdateInstanceName(ctx, req.Name)
+	settings, err := h.svc.UpdateInstanceName(r.Context(), req.Name)
 	if err != nil {
 		return apperr.NewInternal("failed to update instance name", err)
 	}
@@ -131,12 +102,10 @@ func (h *StatsHandler) UpdateInstanceName(w http.ResponseWriter, r *http.Request
 		createdAt = &formatted
 	}
 
-	response := InstanceInfoResponse{
+	return httputil.OKResult(w, InstanceInfoResponse{
 		Version:   h.version,
 		CommitSHA: h.commitSHA,
 		Name:      settings.Name,
 		CreatedAt: createdAt,
-	}
-
-	return httputil.OKResult(w, response)
+	})
 }

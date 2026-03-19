@@ -9,26 +9,27 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"bungleware/vault/internal/apperr"
 	"bungleware/vault/internal/auth"
-	"bungleware/vault/internal/db"
 	sqlc "bungleware/vault/internal/db/sqlc"
 	"bungleware/vault/internal/httputil"
+	"bungleware/vault/internal/service"
 
 	_ "github.com/mattn/go-sqlite3"
 )
 
 type InstanceHandler struct {
-	db      *db.DB
+	svc     service.InstanceService
 	dataDir string
 	wsHub   *WSHub
 }
 
-func NewInstanceHandler(database *db.DB, dataDir string, wsHub *WSHub) *InstanceHandler {
+func NewInstanceHandler(svc service.InstanceService, dataDir string, wsHub *WSHub) *InstanceHandler {
 	return &InstanceHandler{
-		db:      database,
+		svc:     svc,
 		dataDir: dataDir,
 		wsHub:   wsHub,
 	}
@@ -41,22 +42,10 @@ type ExportManifest struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
-// GetExportSize returns the estimated export size in bytes
 func (h *InstanceHandler) GetExportSize(w http.ResponseWriter, r *http.Request) error {
-	userID, err := httputil.RequireUserID(r)
-	if err != nil {
-		return apperr.NewUnauthorized("unauthorized")
-	}
-
-	user, err := h.db.Queries.GetUserByID(r.Context(), int64(userID))
-	if err != nil || !user.IsAdmin {
-		return apperr.NewForbidden("admin access required")
-	}
-
 	var totalBytes int64
 
-	// Database files
-	dbPath := h.db.GetPath()
+	dbPath := h.svc.GetDBPath()
 	if info, err := os.Stat(dbPath); err == nil {
 		totalBytes += info.Size()
 	}
@@ -64,7 +53,6 @@ func (h *InstanceHandler) GetExportSize(w http.ResponseWriter, r *http.Request) 
 		totalBytes += info.Size()
 	}
 
-	// Projects directory
 	projectsDir := filepath.Join(h.dataDir, "projects")
 	filepath.Walk(projectsDir, func(_ string, info os.FileInfo, err error) error {
 		if err == nil && !info.IsDir() {
@@ -76,7 +64,6 @@ func (h *InstanceHandler) GetExportSize(w http.ResponseWriter, r *http.Request) 
 	return httputil.OKResult(w, map[string]int64{"size_bytes": totalBytes})
 }
 
-// ExportInstance streams a complete backup as ZIP
 func (h *InstanceHandler) ExportInstance(w http.ResponseWriter, r *http.Request) error {
 	userID, err := httputil.RequireUserID(r)
 	if err != nil {
@@ -85,18 +72,13 @@ func (h *InstanceHandler) ExportInstance(w http.ResponseWriter, r *http.Request)
 
 	ctx := r.Context()
 
-	user, err := h.db.Queries.GetUserByID(ctx, int64(userID))
-	if err != nil || !user.IsAdmin {
-		return apperr.NewForbidden("admin access required")
-	}
-
-	instanceInfo, err := h.db.Queries.GetInstanceSettings(ctx)
+	instanceInfo, err := h.svc.GetInstanceSettings(ctx)
 	if err != nil {
 		return apperr.NewInternal("failed to get instance info", err)
 	}
 
 	// Use a dedicated read-only connection for checkpoint: ForceCheckpoint(TRUNCATE) deadlocks with the pool
-	dbPath := h.db.GetPath()
+	dbPath := h.svc.GetDBPath()
 	tmpDB, err := sql.Open("sqlite3", fmt.Sprintf("%s?_journal_mode=WAL&mode=ro", dbPath))
 	if err != nil {
 		return apperr.NewInternal("failed to open database for export", err)
@@ -121,10 +103,9 @@ func (h *InstanceHandler) ExportInstance(w http.ResponseWriter, r *http.Request)
 	}
 	manifestJSON, _ := json.Marshal(manifest)
 
-	// Count total files for progress reporting
 	totalFiles := 2 // manifest.json + vault.db
 	if _, err := os.Stat(dbPath + "-wal"); err == nil {
-		totalFiles++ // vault.db-wal
+		totalFiles++
 	}
 	projectsDir := filepath.Join(h.dataDir, "projects")
 	if _, err := os.Stat(projectsDir); err == nil {
@@ -158,7 +139,6 @@ func (h *InstanceHandler) ExportInstance(w http.ResponseWriter, r *http.Request)
 	}
 	sendProgress("vault.db")
 
-	// Include WAL for complete backup
 	walPath := dbPath + "-wal"
 	if walFile, err := os.Open(walPath); err == nil {
 		defer walFile.Close()
@@ -190,7 +170,7 @@ func (h *InstanceHandler) addDirToZip(zw *zip.Writer, dir string, prefix string,
 
 		file, err := os.Open(path)
 		if err != nil {
-			return nil // Skip on error
+			return nil
 		}
 		defer file.Close()
 
@@ -236,7 +216,6 @@ func (h *InstanceHandler) sendImportProgress(userID int, stage string, current, 
 	})
 }
 
-// ImportInstance replaces data with uploaded backup
 func (h *InstanceHandler) ImportInstance(w http.ResponseWriter, r *http.Request) error {
 	userID, err := httputil.RequireUserID(r)
 	if err != nil {
@@ -245,12 +224,7 @@ func (h *InstanceHandler) ImportInstance(w http.ResponseWriter, r *http.Request)
 
 	ctx := r.Context()
 
-	user, err := h.db.Queries.GetUserByID(ctx, int64(userID))
-	if err != nil || !user.IsAdmin {
-		return apperr.NewForbidden("admin access required")
-	}
-
-	if err := r.ParseMultipartForm(32 << 20); err != nil { // 32MB memory, rest spills to disk
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		return apperr.NewBadRequest("failed to parse form")
 	}
 
@@ -310,13 +284,13 @@ func (h *InstanceHandler) ImportInstance(w http.ResponseWriter, r *http.Request)
 
 	h.sendImportProgress(userID, "replacing", 0, 0, "")
 
-	if err := h.db.ForceCheckpoint(); err != nil {
+	if err := h.svc.ForceCheckpoint(); err != nil {
 		return apperr.NewInternal("failed to prepare current database", err)
 	}
 
-	h.db.Close()
+	h.svc.CloseDB()
 
-	dbPath := h.db.GetPath()
+	dbPath := h.svc.GetDBPath()
 	newDBPath := filepath.Join(tmpExtractDir, "vault.db")
 
 	if err := os.Rename(newDBPath, dbPath); err != nil {
@@ -339,22 +313,23 @@ func (h *InstanceHandler) ImportInstance(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	if err := h.db.Reconnect(); err != nil {
+	if err := h.svc.ReconnectDB(); err != nil {
 		return apperr.NewInternal("failed to reconnect database", err)
 	}
 
-	// Invalidate sessions so existing JWTs no longer work
-	if err := h.db.Queries.InvalidateSessions(ctx); err != nil {
+	if err := h.svc.InvalidateSessions(ctx); err != nil {
 		return apperr.NewInternal("failed to invalidate sessions", err)
 	}
 
-	// Return success - frontend will handle redirect and token clearing
 	return httputil.OKResult(w, map[string]string{"status": "success"})
 }
 
-// extractZipFile extracts a single file from ZIP
 func (h *InstanceHandler) extractZipFile(f *zip.File, dest string) error {
 	path := filepath.Join(dest, f.Name)
+
+	if !strings.HasPrefix(filepath.Clean(path), filepath.Clean(dest)+string(os.PathSeparator)) {
+		return fmt.Errorf("invalid file path in archive: %s", f.Name)
+	}
 
 	if f.FileInfo().IsDir() {
 		return os.MkdirAll(path, f.FileInfo().Mode())
@@ -380,19 +355,8 @@ func (h *InstanceHandler) extractZipFile(f *zip.File, dest string) error {
 	return err
 }
 
-// ResetInstance deletes all data and restores to clean state
 func (h *InstanceHandler) ResetInstance(w http.ResponseWriter, r *http.Request) error {
-	userID, err := httputil.RequireUserID(r)
-	if err != nil {
-		return apperr.NewUnauthorized("unauthorized")
-	}
-
 	ctx := r.Context()
-
-	user, err := h.db.Queries.GetUserByID(ctx, int64(userID))
-	if err != nil || !user.IsAdmin {
-		return apperr.NewForbidden("admin access required")
-	}
 
 	type NewAdminRequest struct {
 		Username string `json:"username"`
@@ -403,12 +367,13 @@ func (h *InstanceHandler) ResetInstance(w http.ResponseWriter, r *http.Request) 
 		ConfirmName string           `json:"confirm_name"`
 		NewAdmin    *NewAdminRequest `json:"new_admin,omitempty"`
 	}
-	var req ResetRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+
+	req, err := httputil.DecodeJSON[ResetRequest](r)
+	if err != nil {
 		return apperr.NewBadRequest("invalid request")
 	}
 
-	instanceInfo, err := h.db.Queries.GetInstanceSettings(ctx)
+	instanceInfo, err := h.svc.GetInstanceSettings(ctx)
 	if err != nil {
 		return apperr.NewInternal("failed to get instance info", err)
 	}
@@ -417,9 +382,9 @@ func (h *InstanceHandler) ResetInstance(w http.ResponseWriter, r *http.Request) 
 		return apperr.NewBadRequest("instance name does not match")
 	}
 
-	h.db.Close()
+	h.svc.CloseDB()
 
-	dbPath := h.db.GetPath()
+	dbPath := h.svc.GetDBPath()
 	os.Remove(dbPath)
 	os.Remove(dbPath + "-shm")
 	os.Remove(dbPath + "-wal")
@@ -428,7 +393,7 @@ func (h *InstanceHandler) ResetInstance(w http.ResponseWriter, r *http.Request) 
 	os.RemoveAll(projectsDir)
 	os.MkdirAll(projectsDir, 0755)
 
-	if err := h.db.Reconnect(); err != nil {
+	if err := h.svc.ReconnectDB(); err != nil {
 		return apperr.NewInternal("failed to reinitialize database", err)
 	}
 
@@ -442,7 +407,7 @@ func (h *InstanceHandler) ResetInstance(w http.ResponseWriter, r *http.Request) 
 			return apperr.NewInternal("failed to hash password", err)
 		}
 
-		newUser, err := h.db.Queries.CreateUser(ctx, sqlc.CreateUserParams{
+		newUser, err := h.svc.CreateUser(ctx, sqlc.CreateUserParams{
 			Username:     req.NewAdmin.Username,
 			Email:        req.NewAdmin.Email,
 			PasswordHash: passwordHash,
@@ -453,7 +418,7 @@ func (h *InstanceHandler) ResetInstance(w http.ResponseWriter, r *http.Request) 
 			return apperr.NewInternal("failed to create admin user", err)
 		}
 
-		if err := h.db.Queries.CreateUserPreferences(ctx, sqlc.CreateUserPreferencesParams{
+		if err := h.svc.CreateUserPreferences(ctx, sqlc.CreateUserPreferencesParams{
 			UserID:         newUser.ID,
 			DefaultQuality: "lossy",
 		}); err != nil {
@@ -461,7 +426,7 @@ func (h *InstanceHandler) ResetInstance(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	if err := h.db.Queries.InvalidateSessions(ctx); err != nil {
+	if err := h.svc.InvalidateSessions(ctx); err != nil {
 		return apperr.NewInternal("failed to invalidate sessions", err)
 	}
 

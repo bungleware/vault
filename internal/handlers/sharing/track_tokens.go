@@ -1,24 +1,15 @@
 package sharing
 
 import (
-	"context"
-	"database/sql"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
-	"strconv"
-	"time"
 
 	"bungleware/vault/internal/apperr"
-	"bungleware/vault/internal/auth"
-	sqlc "bungleware/vault/internal/db/sqlc"
 	"bungleware/vault/internal/handlers"
 	"bungleware/vault/internal/httputil"
+	"bungleware/vault/internal/service"
 	"bungleware/vault/internal/sqlutil"
-
-	"golang.org/x/crypto/bcrypt"
 )
 
 func (h *SharingHandler) CreateShareToken(w http.ResponseWriter, r *http.Request) error {
@@ -32,103 +23,51 @@ func (h *SharingHandler) CreateShareToken(w http.ResponseWriter, r *http.Request
 		return apperr.NewBadRequest("track ID required")
 	}
 
-	var req handlers.CreateShareTokenRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	req, err := httputil.DecodeJSON[handlers.CreateShareTokenRequest](r)
+	if err != nil {
 		return apperr.NewBadRequest("invalid request body")
 	}
 
-	ctx := r.Context()
-
-	track, err := h.db.Queries.GetTrackByPublicIDNoFilter(ctx, trackIDStr)
-	if err := httputil.HandleDBError(err, "track not found", "failed to verify track"); err != nil {
-		return err
-	}
-
-	canManage, err := h.canManageTrackShares(ctx, track, int64(userID))
-	if err != nil {
-		return apperr.NewInternal("failed to check permissions", err)
-	}
-	if !canManage {
-		return apperr.NewForbidden("unauthorized")
-	}
-
-	trackID := track.ID
-
+	var versionID *int64
 	if req.VersionID != nil {
-		version, err := h.db.GetTrackVersion(ctx, int64(*req.VersionID))
-		if err := httputil.HandleDBError(err, "version not found", "failed to verify version"); err != nil {
-			return err
-		}
-		if version.TrackID != trackID {
-			return apperr.NewBadRequest("version does not belong to track")
-		}
+		id := int64(*req.VersionID)
+		versionID = &id
 	}
-
-	token, err := auth.GenerateSecureToken(32)
-	if err != nil {
-		return apperr.NewInternal("failed to generate token", err)
-	}
-
-	passwordHash, err := hashSharePassword(req.Password)
-	if err != nil {
-		return apperr.NewInternal("failed to hash password", err)
-	}
-
-	var versionID sql.NullInt64
-	if req.VersionID != nil {
-		versionID = sql.NullInt64{Int64: int64(*req.VersionID), Valid: true}
-	}
-
-	var expiresAt sql.NullTime
-	if req.ExpiresAt != nil {
-		expiresAt = sql.NullTime{Time: *req.ExpiresAt, Valid: true}
-	}
-
-	var maxAccessCount sql.NullInt64
+	var maxAccessCount *int64
 	if req.MaxAccessCount != nil {
-		maxAccessCount = sql.NullInt64{Int64: int64(*req.MaxAccessCount), Valid: true}
+		mac := int64(*req.MaxAccessCount)
+		maxAccessCount = &mac
 	}
 
-	visibilityType := "invite_only"
-	if req.VisibilityType != nil {
-		visibilityType = *req.VisibilityType
-	}
-
-	shareToken, err := h.db.CreateShareToken(ctx, sqlc.CreateShareTokenParams{
-		Token:          token,
-		UserID:         int64(userID),
-		TrackID:        trackID,
+	shareToken, err := h.svc.CreateTrackShareToken(r.Context(), int64(userID), trackIDStr, service.CreateTrackShareTokenInput{
 		VersionID:      versionID,
-		ExpiresAt:      expiresAt,
+		Password:       req.Password,
+		ExpiresAt:      req.ExpiresAt,
 		MaxAccessCount: maxAccessCount,
-		AllowEditing:   req.AllowEditing != nil && *req.AllowEditing,
-		AllowDownloads: req.AllowDownloads == nil || *req.AllowDownloads, // Default true
-		PasswordHash:   passwordHash,
-		VisibilityType: visibilityType,
+		AllowEditing:   req.AllowEditing,
+		AllowDownloads: req.AllowDownloads,
+		VisibilityType: req.VisibilityType,
 	})
 	if err != nil {
-		return apperr.NewInternal("failed to create share token", err)
+		return mapSharingErr(err)
 	}
-
-	shareURL := buildShareURL(r, token)
 
 	response := &handlers.ShareTokenResponse{
 		ID:                 shareToken.ID,
 		Token:              shareToken.Token,
 		UserID:             shareToken.UserID,
 		TrackID:            shareToken.TrackID,
-		VersionID:          shareToken.VersionID,
-		ExpiresAt:          shareToken.ExpiresAt,
-		MaxAccessCount:     shareToken.MaxAccessCount,
+		VersionID:          sqlutil.Int64Ptr(shareToken.VersionID),
+		ExpiresAt:          sqlutil.TimePtr(shareToken.ExpiresAt),
+		MaxAccessCount:     sqlutil.Int64Ptr(shareToken.MaxAccessCount),
 		CurrentAccessCount: shareToken.CurrentAccessCount.Int64,
 		AllowEditing:       shareToken.AllowEditing,
 		AllowDownloads:     shareToken.AllowDownloads,
 		HasPassword:        shareToken.PasswordHash.Valid,
 		VisibilityType:     shareToken.VisibilityType,
 		CreatedAt:          shareToken.CreatedAt.Time,
-		ShareURL:           shareURL,
+		ShareURL:           h.buildShareURL(r, shareToken.Token),
 	}
-
 	return httputil.CreatedResult(w, response)
 }
 
@@ -139,197 +78,128 @@ func (h *SharingHandler) ValidateShareToken(w http.ResponseWriter, r *http.Reque
 	}
 
 	password := r.URL.Query().Get("password")
-
 	ctx := r.Context()
 
-	shareToken, err := h.db.GetShareToken(ctx, token)
+	// Try track share first.
+	result, err := h.svc.ValidateTrackShare(ctx, token, password)
 	if err == nil {
-		return h.validateTrackShare(w, r, shareToken, password, ctx)
+		return h.writeTrackShareResponse(w, r, result)
+	}
+	if !errors.Is(err, service.ErrNotFound) {
+		return h.writeShareValidationError(w, err)
 	}
 
-	if errors.Is(err, sql.ErrNoRows) {
-		projectShareToken, err := h.db.GetProjectShareToken(ctx, token)
-		if err := httputil.HandleDBError(err, "invalid token", "failed to query token"); err != nil {
-			return err
+	// Fall back to project share.
+	pResult, err := h.svc.ValidateProjectShare(ctx, token, password)
+	if err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return apperr.NewNotFound("invalid token")
 		}
-		return h.validateProjectShare(w, r, projectShareToken, password, ctx)
+		return h.writeShareValidationError(w, err)
 	}
-
-	return apperr.NewInternal("failed to query token", err)
+	return h.writeProjectShareResponse(w, r, pResult)
 }
 
-func (h *SharingHandler) validateTrackShare(w http.ResponseWriter, r *http.Request, shareToken sqlc.ShareToken, password string, ctx context.Context) error {
-	if shareToken.PasswordHash.Valid {
-		if password == "" {
-			return httputil.OKResult(w, &handlers.ValidateShareResponse{
-				Valid:            false,
-				PasswordRequired: true,
-			})
-		}
-		if err := bcrypt.CompareHashAndPassword([]byte(shareToken.PasswordHash.String), []byte(password)); err != nil {
-			return httputil.OKResult(w, &handlers.ValidateShareResponse{
-				Valid:            false,
-				PasswordRequired: true,
-				Error:            "invalid password",
-			})
-		}
+func (h *SharingHandler) writeShareValidationError(w http.ResponseWriter, err error) error {
+	switch {
+	case errors.Is(err, service.ErrPasswordRequired):
+		return httputil.OKResult(w, &handlers.ValidateShareResponse{Valid: false, PasswordRequired: true})
+	case errors.Is(err, service.ErrInvalidPassword):
+		return httputil.OKResult(w, &handlers.ValidateShareResponse{Valid: false, PasswordRequired: true, Error: "invalid password"})
+	case errors.Is(err, service.ErrShareExpired):
+		return httputil.OKResult(w, &handlers.ValidateShareResponse{Valid: false, Error: "token expired"})
+	case errors.Is(err, service.ErrAccessLimitReached):
+		return httputil.OKResult(w, &handlers.ValidateShareResponse{Valid: false, Error: "max access count reached"})
+	default:
+		return apperr.NewInternal("failed to validate token", err)
 	}
+}
 
-	if shareToken.ExpiresAt.Valid && shareToken.ExpiresAt.Time.Before(time.Now()) {
-		return httputil.OKResult(w, &handlers.ValidateShareResponse{
-			Valid: false,
-			Error: "token expired",
-		})
-	}
-
-	if shareToken.MaxAccessCount.Valid && shareToken.CurrentAccessCount.Int64 >= shareToken.MaxAccessCount.Int64 {
-		return httputil.OKResult(w, &handlers.ValidateShareResponse{
-			Valid: false,
-			Error: "max access count reached",
-		})
-	}
-
-	trackDetails, err := h.db.GetTrackWithDetails(ctx, sqlc.GetTrackWithDetailsParams{
-		ID:     shareToken.TrackID,
-		UserID: shareToken.UserID,
-	})
-	if err != nil {
-		return apperr.NewInternal("failed to query track", err)
-	}
-
-	project, err := h.db.GetProjectByID(ctx, trackDetails.ProjectID)
-	if err != nil {
-		return apperr.NewInternal("failed to query project", err)
-	}
-
-	user, err := h.db.GetUserByID(ctx, shareToken.UserID)
-	if err != nil {
-		return apperr.NewInternal("failed to query user", err)
-	}
-
-	var version *sqlc.TrackVersion
-	versionID := shareToken.VersionID
-	if !versionID.Valid && trackDetails.ActiveVersionID.Valid {
-		versionID = trackDetails.ActiveVersionID
-	}
-
-	if versionID.Valid {
-		v, err := h.db.GetTrackVersion(ctx, versionID.Int64)
-		if err == nil {
-			version = &v
-		}
-	}
-
-	h.db.IncrementAccessCount(ctx, shareToken.ID)
-
-	slog.InfoContext(ctx, "Share token accessed",
+func (h *SharingHandler) writeTrackShareResponse(w http.ResponseWriter, r *http.Request, result *service.ValidateTrackShareResult) error {
+	slog.InfoContext(r.Context(), "Share token accessed",
 		"token_type", "track",
-		"track_id", trackDetails.ID,
-		"has_password", shareToken.PasswordHash.Valid,
+		"track_id", result.Track.ID,
+		"has_password", result.Token.PasswordHash.Valid,
 		"ip", r.RemoteAddr,
 	)
 
 	var coverURL *string
-	if project.CoverArtPath.Valid && project.CoverArtPath.String != "" {
-		scheme := "http"
-		if r.TLS != nil {
-			scheme = "https"
-		}
-		url := fmt.Sprintf("%s://%s/api/share/%s/cover", scheme, r.Host, shareToken.Token)
+	if result.Project.CoverArtPath.Valid && result.Project.CoverArtPath.String != "" {
+		url := h.buildShareCoverURL(r, result.Token.Token)
 		coverURL = &url
 	}
 
 	var artist *string
-	if project.AuthorOverride.Valid && project.AuthorOverride.String != "" {
-		artist = &project.AuthorOverride.String
-	} else if trackDetails.Artist.Valid && trackDetails.Artist.String != "" {
-		artist = &trackDetails.Artist.String
+	if result.Project.AuthorOverride.Valid && result.Project.AuthorOverride.String != "" {
+		artist = &result.Project.AuthorOverride.String
+	} else if result.Track.Artist.Valid && result.Track.Artist.String != "" {
+		artist = &result.Track.Artist.String
 	} else {
-		artist = &user.Username
+		artist = &result.User.Username
 	}
 
 	trackDetail := &handlers.SharedTrackDetail{
-		ID:               trackDetails.ID,
-		UserID:           trackDetails.UserID,
-		ProjectID:        trackDetails.ProjectID,
-		PublicID:         trackDetails.PublicID,
-		Title:            trackDetails.Title,
+		ID:               result.Track.ID,
+		UserID:           result.Track.UserID,
+		ProjectID:        result.Track.ProjectID,
+		PublicID:         result.Track.PublicID,
+		Title:            result.Track.Title,
 		Artist:           artist,
-		Album:            sqlutil.StringPtr(trackDetails.Album),
-		Key:              sqlutil.StringPtr(trackDetails.Key),
-		BPM:              sqlutil.Int64Ptr(trackDetails.Bpm),
-		Waveform:         sqlutil.StringPtr(trackDetails.Waveform),
-		ActiveVersionID:  sqlutil.Int64Ptr(trackDetails.ActiveVersionID),
-		TrackOrder:       trackDetails.TrackOrder,
-		VisibilityStatus: trackDetails.VisibilityStatus,
+		Album:            sqlutil.StringPtr(result.Track.Album),
+		Key:              sqlutil.StringPtr(result.Track.Key),
+		BPM:              sqlutil.Int64Ptr(result.Track.Bpm),
+		Waveform:         sqlutil.StringPtr(result.Track.Waveform),
+		ActiveVersionID:  sqlutil.Int64Ptr(result.Track.ActiveVersionID),
+		TrackOrder:       result.Track.TrackOrder,
+		VisibilityStatus: result.Track.VisibilityStatus,
 		CoverURL:         coverURL,
-		CreatedAt:        trackDetails.CreatedAt.Time,
-		UpdatedAt:        trackDetails.UpdatedAt.Time,
+		CreatedAt:        result.Track.CreatedAt.Time,
+		UpdatedAt:        sqlutil.TimePtr(result.Track.UpdatedAt),
 	}
-
 	projectDetail := &handlers.SharedProjectDetail{
-		ID:             project.ID,
-		PublicID:       project.PublicID,
-		Name:           project.Name,
-		UserID:         project.UserID,
-		AuthorOverride: sqlutil.StringPtr(project.AuthorOverride),
+		ID:             result.Project.ID,
+		PublicID:       result.Project.PublicID,
+		Name:           result.Project.Name,
+		UserID:         result.Project.UserID,
+		AuthorOverride: sqlutil.StringPtr(result.Project.AuthorOverride),
 		CoverURL:       coverURL,
-		CreatedAt:      project.CreatedAt.Time,
-		UpdatedAt:      project.UpdatedAt.Time,
+		CreatedAt:      result.Project.CreatedAt.Time,
+		UpdatedAt:      sqlutil.TimePtr(result.Project.UpdatedAt),
 	}
 
-	response := &handlers.ValidateShareResponse{
+	return httputil.OKResult(w, &handlers.ValidateShareResponse{
 		Valid:          true,
 		Track:          trackDetail,
 		Project:        projectDetail,
-		Version:        version,
-		AllowEditing:   shareToken.AllowEditing,
-		AllowDownloads: shareToken.AllowDownloads,
-	}
+		Version:        result.Version,
+		AllowEditing:   result.AllowEditing,
+		AllowDownloads: result.AllowDownloads,
+	})
+}
 
-	return httputil.OKResult(w, response)
+type updateSharedTrackReq struct {
+	Title    string `json:"title"`
+	Password string `json:"password,omitempty"`
 }
 
 func (h *SharingHandler) UpdateSharedTrackFromToken(w http.ResponseWriter, r *http.Request) error {
-	ctx := r.Context()
 	token := r.PathValue("token")
-	trackID := r.PathValue("trackId")
 
-	shareToken, err := h.db.Queries.GetShareToken(ctx, token)
+	req, err := httputil.DecodeJSON[updateSharedTrackReq](r)
 	if err != nil {
-		return apperr.NewUnauthorized("invalid share token")
-	}
-
-	if !shareToken.AllowEditing {
-		return apperr.NewForbidden("editing not allowed")
-	}
-
-	var req struct {
-		Title string `json:"title"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return apperr.NewBadRequest("invalid request")
 	}
 
-	trackIDInt, err := strconv.ParseInt(trackID, 10, 64)
+	trackID, err := httputil.PathInt64(r, "trackId")
 	if err != nil {
 		return apperr.NewBadRequest("invalid track id")
 	}
 
-	track, err := h.db.Queries.GetTrackByID(ctx, trackIDInt)
+	updated, err := h.svc.UpdateSharedTrackFromToken(r.Context(), token, trackID, req.Title, req.Password)
 	if err != nil {
-		return apperr.NewNotFound("track not found")
+		return mapSharingErr(err)
 	}
-
-	updatedTrack, err := h.db.Queries.UpdateTrack(ctx, sqlc.UpdateTrackParams{
-		ID:    track.ID,
-		Title: req.Title,
-	})
-	if err != nil {
-		return apperr.NewInternal("failed to update track", err)
-	}
-
-	return httputil.OKResult(w, updatedTrack)
+	return httputil.OKResult(w, updated)
 }
 
 func (h *SharingHandler) ListShareTokens(w http.ResponseWriter, r *http.Request) error {
@@ -338,18 +208,10 @@ func (h *SharingHandler) ListShareTokens(w http.ResponseWriter, r *http.Request)
 		return apperr.NewUnauthorized("user not found in context")
 	}
 
-	ctx := r.Context()
-
-	tokens, err := h.db.ListShareTokensWithTrackInfo(ctx, int64(userID))
+	tokens, err := h.svc.ListTrackShareTokens(r.Context(), int64(userID))
 	if err != nil {
 		return apperr.NewInternal("failed to query tokens", err)
 	}
-
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	host := r.Host
 
 	response := make([]*handlers.ShareTokenResponse, len(tokens))
 	for i, token := range tokens {
@@ -359,20 +221,19 @@ func (h *SharingHandler) ListShareTokens(w http.ResponseWriter, r *http.Request)
 			UserID:             token.UserID,
 			TrackID:            token.TrackID,
 			TrackPublicID:      token.TrackPublicID,
-			VersionID:          token.VersionID,
-			ExpiresAt:          token.ExpiresAt,
-			MaxAccessCount:     token.MaxAccessCount,
+			VersionID:          sqlutil.Int64Ptr(token.VersionID),
+			ExpiresAt:          sqlutil.TimePtr(token.ExpiresAt),
+			MaxAccessCount:     sqlutil.Int64Ptr(token.MaxAccessCount),
 			CurrentAccessCount: token.CurrentAccessCount.Int64,
 			AllowEditing:       token.AllowEditing,
 			AllowDownloads:     token.AllowDownloads,
 			HasPassword:        token.PasswordHash.Valid,
 			VisibilityType:     token.VisibilityType,
 			CreatedAt:          token.CreatedAt.Time,
-			UpdatedAt:          token.UpdatedAt.Time,
-			ShareURL:           scheme + "://" + host + "/share/" + token.Token,
+			UpdatedAt:          sqlutil.TimePtr(token.UpdatedAt),
+			ShareURL:           h.buildShareURL(r, token.Token),
 		}
 	}
-
 	return httputil.OKResult(w, response)
 }
 
@@ -387,70 +248,42 @@ func (h *SharingHandler) UpdateShareToken(w http.ResponseWriter, r *http.Request
 		return err
 	}
 
-	var req handlers.CreateShareTokenRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	req, err := httputil.DecodeJSON[handlers.CreateShareTokenRequest](r)
+	if err != nil {
 		return apperr.NewBadRequest("invalid request body")
 	}
 
-	ctx := r.Context()
-
-	existingToken, err := h.db.GetShareTokenByID(ctx, sqlc.GetShareTokenByIDParams{
-		ID:     tokenID,
-		UserID: int64(userID),
-	})
-	if err := httputil.HandleDBError(err, "share token not found", "failed to get token"); err != nil {
-		return err
-	}
-
-	if existingToken.UserID != int64(userID) {
-		return apperr.NewForbidden("unauthorized")
-	}
-
-	passwordHash, err := hashSharePassword(req.Password)
-	if err != nil {
-		return apperr.NewInternal("failed to hash password", err)
-	}
-
-	updatedToken, err := h.db.UpdateShareToken(ctx, sqlc.UpdateShareTokenParams{
-		ExpiresAt:      existingToken.ExpiresAt,
-		MaxAccessCount: existingToken.MaxAccessCount,
-		AllowEditing:   req.AllowEditing != nil && *req.AllowEditing,
-		AllowDownloads: req.AllowDownloads != nil && *req.AllowDownloads,
-		PasswordHash:   passwordHash,
-		VisibilityType: existingToken.VisibilityType,
-		ID:             tokenID,
-		UserID:         int64(userID),
+	result, err := h.svc.UpdateTrackShareToken(r.Context(), int64(userID), tokenID, service.UpdateShareTokenInput{
+		AllowEditing:   req.AllowEditing,
+		AllowDownloads: req.AllowDownloads,
+		Password:       req.Password,
 	})
 	if err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return apperr.NewNotFound("share token not found")
+		}
 		return apperr.NewInternal("failed to update token", err)
 	}
 
-	track, err := h.db.GetTrackByID(ctx, updatedToken.TrackID)
-	if err != nil {
-		return apperr.NewInternal("failed to get track", err)
-	}
-
-	shareURL := buildShareURL(r, updatedToken.Token)
-
+	shareURL := h.buildShareURL(r, result.Token.Token)
 	response := &handlers.ShareTokenResponse{
-		ID:                 updatedToken.ID,
-		Token:              updatedToken.Token,
-		UserID:             updatedToken.UserID,
-		TrackID:            updatedToken.TrackID,
-		TrackPublicID:      track.PublicID,
-		AllowEditing:       updatedToken.AllowEditing,
-		AllowDownloads:     updatedToken.AllowDownloads,
-		HasPassword:        updatedToken.PasswordHash.Valid,
-		VisibilityType:     updatedToken.VisibilityType,
-		CreatedAt:          updatedToken.CreatedAt.Time,
-		UpdatedAt:          updatedToken.UpdatedAt.Time,
+		ID:                 result.Token.ID,
+		Token:              result.Token.Token,
+		UserID:             result.Token.UserID,
+		TrackID:            result.Token.TrackID,
+		TrackPublicID:      result.TrackPublicID,
+		AllowEditing:       result.Token.AllowEditing,
+		AllowDownloads:     result.Token.AllowDownloads,
+		HasPassword:        result.Token.PasswordHash.Valid,
+		VisibilityType:     result.Token.VisibilityType,
+		CreatedAt:          result.Token.CreatedAt.Time,
+		UpdatedAt:          sqlutil.TimePtr(result.Token.UpdatedAt),
 		ShareURL:           shareURL,
-		ExpiresAt:          updatedToken.ExpiresAt,
-		MaxAccessCount:     updatedToken.MaxAccessCount,
-		CurrentAccessCount: updatedToken.CurrentAccessCount.Int64,
-		VersionID:          updatedToken.VersionID,
+		ExpiresAt:          sqlutil.TimePtr(result.Token.ExpiresAt),
+		MaxAccessCount:     sqlutil.Int64Ptr(result.Token.MaxAccessCount),
+		CurrentAccessCount: result.Token.CurrentAccessCount.Int64,
+		VersionID:          sqlutil.Int64Ptr(result.Token.VersionID),
 	}
-
 	return httputil.OKResult(w, response)
 }
 
@@ -465,15 +298,80 @@ func (h *SharingHandler) DeleteShareToken(w http.ResponseWriter, r *http.Request
 		return err
 	}
 
-	ctx := r.Context()
-
-	err = h.db.DeleteShareToken(ctx, sqlc.DeleteShareTokenParams{
-		ID:     tokenID,
-		UserID: int64(userID),
-	})
-	if err != nil {
+	if err := h.svc.DeleteTrackShareToken(r.Context(), int64(userID), tokenID); err != nil {
 		return apperr.NewInternal("failed to delete token", err)
 	}
-
 	return httputil.NoContentResult(w)
 }
+
+// writeProjectShareResponse is defined here since ValidateShareToken calls it.
+func (h *SharingHandler) writeProjectShareResponse(w http.ResponseWriter, r *http.Request, result *service.ValidateProjectShareResult) error {
+	slog.InfoContext(r.Context(), "Share token accessed",
+		"token_type", "project",
+		"project_id", result.Token.ProjectID,
+		"has_password", result.Token.PasswordHash.Valid,
+		"ip", r.RemoteAddr,
+	)
+
+	var coverURL *string
+	if result.Project.CoverArtPath.Valid && result.Project.CoverArtPath.String != "" {
+		url := result.Project.CoverArtPath.String
+		coverURL = &url
+	}
+
+	var author string
+	if result.Project.AuthorOverride.Valid && result.Project.AuthorOverride.String != "" {
+		author = result.Project.AuthorOverride.String
+	} else {
+		author = result.User.Username
+	}
+
+	projectDetail := &handlers.SharedProjectDetail{
+		ID:             result.Project.ID,
+		PublicID:       result.Project.PublicID,
+		Name:           result.Project.Name,
+		UserID:         result.Project.UserID,
+		AuthorOverride: &author,
+		CoverURL:       coverURL,
+		CreatedAt:      result.Project.CreatedAt.Time,
+		UpdatedAt:      sqlutil.TimePtr(result.Project.UpdatedAt),
+	}
+
+	// Build typed track list
+	tracks := make([]handlers.SharedProjectTrack, len(result.Tracks))
+	for i, t := range result.Tracks {
+		var activeVersionName *string
+		if t.ActiveVersionName != "" {
+			activeVersionName = &t.ActiveVersionName
+		}
+		tracks[i] = handlers.SharedProjectTrack{
+			ID:                           t.ID,
+			UserID:                       t.UserID,
+			ProjectID:                    t.ProjectID,
+			PublicID:                     t.PublicID,
+			Title:                        t.Title,
+			TrackOrder:                   t.TrackOrder,
+			VisibilityStatus:             t.VisibilityStatus,
+			ActiveVersionID:              sqlutil.Int64Ptr(t.ActiveVersionID),
+			ActiveVersionName:            activeVersionName,
+			ActiveVersionDurationSeconds: sqlutil.Float64Ptr(t.ActiveVersionDurationSeconds),
+			Waveform:                     sqlutil.StringPtr(t.Waveform),
+			LossyTranscodingStatus:       sqlutil.StringPtr(t.LossyTranscodingStatus),
+			Artist:                       sqlutil.StringPtr(t.Artist),
+			Album:                        sqlutil.StringPtr(t.Album),
+			Key:                          sqlutil.StringPtr(t.Key),
+			BPM:                          sqlutil.Int64Ptr(t.Bpm),
+			CreatedAt:                    sqlutil.TimePtr(t.CreatedAt),
+			UpdatedAt:                    sqlutil.TimePtr(t.UpdatedAt),
+		}
+	}
+
+	return httputil.OKResult(w, &handlers.ValidateShareResponse{
+		Valid:          true,
+		Project:        projectDetail,
+		Tracks:         tracks,
+		AllowEditing:   result.AllowEditing,
+		AllowDownloads: result.AllowDownloads,
+	})
+}
+

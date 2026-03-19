@@ -6,17 +6,17 @@ import (
 	"net/http"
 
 	"bungleware/vault/internal/apperr"
-	"bungleware/vault/internal/db"
 	sqlc "bungleware/vault/internal/db/sqlc"
 	"bungleware/vault/internal/httputil"
+	"bungleware/vault/internal/service"
 )
 
 type OrganizationHandler struct {
-	db *db.DB
+	svc service.OrganizationService
 }
 
-func NewOrganizationHandler(database *db.DB) *OrganizationHandler {
-	return &OrganizationHandler{db: database}
+func NewOrganizationHandler(svc service.OrganizationService) *OrganizationHandler {
+	return &OrganizationHandler{svc: svc}
 }
 
 func convertSharedProjectOrganization(org sqlc.UserSharedProjectOrganization) SharedProjectOrganization {
@@ -89,24 +89,18 @@ func (h *OrganizationHandler) OrganizeSharedProject(w http.ResponseWriter, r *ht
 		return apperr.NewBadRequest("invalid request body")
 	}
 
-	_, err = h.db.GetUserProjectShare(r.Context(), sqlc.GetUserProjectShareParams{
-		ProjectID: projectID,
-		SharedTo:  int64(userID),
-	})
+	_, err = h.svc.GetUserProjectShare(r.Context(), projectID, int64(userID))
 	if err != nil {
 		return apperr.NewNotFound("shared project not found or access denied")
 	}
 
 	var folderID sql.NullInt64
 	if req.FolderID != nil {
-		count, err := h.db.CheckFolderExists(r.Context(), sqlc.CheckFolderExistsParams{
-			ID:     *req.FolderID,
-			UserID: int64(userID),
-		})
+		exists, err := h.svc.CheckFolderExists(r.Context(), *req.FolderID, int64(userID))
 		if err != nil {
 			return apperr.NewInternal("failed to verify folder", err)
 		}
-		if count == 0 {
+		if !exists {
 			return apperr.NewNotFound("folder not found")
 		}
 		folderID = sql.NullInt64{Int64: *req.FolderID, Valid: true}
@@ -117,31 +111,24 @@ func (h *OrganizationHandler) OrganizeSharedProject(w http.ResponseWriter, r *ht
 		customOrder = *req.CustomOrder
 		slog.Debug("[OrganizeSharedProject] Using provided custom_order", "customOrder", customOrder, "projectID", projectID)
 	} else {
-		var result interface{}
+		var maxOrder int64
 		if folderID.Valid {
 			slog.Debug("[OrganizeSharedProject] Calculating max order for project in folder", "projectID", projectID, "folderID", folderID.Int64)
-			result, err = h.db.GetMaxOrderInFolder(r.Context(), sqlc.GetMaxOrderInFolderParams{
-				UserID:   int64(userID),
-				FolderID: sql.NullInt64{Int64: folderID.Int64, Valid: true},
-			})
+			maxOrder, err = h.svc.GetMaxOrderInFolder(r.Context(), int64(userID), folderID.Int64)
 		} else {
 			slog.Debug("[OrganizeSharedProject] Calculating max order for project at root", "projectID", projectID)
-			result, err = h.db.GetMaxOrderAtRoot(r.Context(), int64(userID))
+			maxOrder, err = h.svc.GetMaxOrderAtRoot(r.Context(), int64(userID))
 		}
 		if err == nil {
-			if maxOrder, ok := result.(int64); ok {
-				customOrder = maxOrder + 1
-				slog.Debug("[OrganizeSharedProject] Calculated max_order and assigned custom_order", "maxOrder", maxOrder, "customOrder", customOrder, "projectID", projectID)
-			} else {
-				slog.Debug("[OrganizeSharedProject] Failed to cast max_order result to int64", "result", result)
-			}
+			customOrder = maxOrder + 1
+			slog.Debug("[OrganizeSharedProject] Calculated max_order and assigned custom_order", "maxOrder", maxOrder, "customOrder", customOrder, "projectID", projectID)
 		} else {
 			slog.Debug("[OrganizeSharedProject] Error getting max order", "error", err)
 		}
 	}
 
 	slog.Debug("[OrganizeSharedProject] Upserting project", "projectID", projectID, "folderID", folderID, "customOrder", customOrder)
-	org, err := h.db.UpsertSharedProjectOrganization(r.Context(), sqlc.UpsertSharedProjectOrganizationParams{
+	org, err := h.svc.UpsertSharedProjectOrganization(r.Context(), sqlc.UpsertSharedProjectOrganizationParams{
 		UserID:      int64(userID),
 		ProjectID:   projectID,
 		FolderID:    folderID,
@@ -172,24 +159,18 @@ func (h *OrganizationHandler) OrganizeSharedTrack(w http.ResponseWriter, r *http
 		return apperr.NewBadRequest("invalid request body")
 	}
 
-	_, err = h.db.GetUserTrackShare(r.Context(), sqlc.GetUserTrackShareParams{
-		TrackID:  trackID,
-		SharedTo: int64(userID),
-	})
+	_, err = h.svc.GetUserTrackShare(r.Context(), trackID, int64(userID))
 	if err != nil {
 		return apperr.NewNotFound("shared track not found or access denied")
 	}
 
 	var folderID sql.NullInt64
 	if req.FolderID != nil {
-		count, err := h.db.CheckFolderExists(r.Context(), sqlc.CheckFolderExistsParams{
-			ID:     *req.FolderID,
-			UserID: int64(userID),
-		})
+		exists, err := h.svc.CheckFolderExists(r.Context(), *req.FolderID, int64(userID))
 		if err != nil {
 			return apperr.NewInternal("failed to verify folder", err)
 		}
-		if count == 0 {
+		if !exists {
 			return apperr.NewNotFound("folder not found")
 		}
 		folderID = sql.NullInt64{Int64: *req.FolderID, Valid: true}
@@ -200,31 +181,24 @@ func (h *OrganizationHandler) OrganizeSharedTrack(w http.ResponseWriter, r *http
 		customOrder = *req.CustomOrder
 		slog.Debug("[OrganizeSharedTrack] Using provided custom_order", "customOrder", customOrder, "trackID", trackID)
 	} else {
-		var result interface{}
+		var maxOrder int64
 		if folderID.Valid {
 			slog.Debug("[OrganizeSharedTrack] Calculating max order for track in folder", "trackID", trackID, "folderID", folderID.Int64)
-			result, err = h.db.GetMaxOrderInFolder(r.Context(), sqlc.GetMaxOrderInFolderParams{
-				UserID:   int64(userID),
-				FolderID: sql.NullInt64{Int64: folderID.Int64, Valid: true},
-			})
+			maxOrder, err = h.svc.GetMaxOrderInFolder(r.Context(), int64(userID), folderID.Int64)
 		} else {
 			slog.Debug("[OrganizeSharedTrack] Calculating max order for track at root", "trackID", trackID)
-			result, err = h.db.GetMaxOrderAtRoot(r.Context(), int64(userID))
+			maxOrder, err = h.svc.GetMaxOrderAtRoot(r.Context(), int64(userID))
 		}
 		if err == nil {
-			if maxOrder, ok := result.(int64); ok {
-				customOrder = maxOrder + 1
-				slog.Debug("[OrganizeSharedTrack] Calculated max_order and assigned custom_order", "maxOrder", maxOrder, "customOrder", customOrder, "trackID", trackID)
-			} else {
-				slog.Debug("[OrganizeSharedTrack] Failed to cast max_order result to int64", "result", result)
-			}
+			customOrder = maxOrder + 1
+			slog.Debug("[OrganizeSharedTrack] Calculated max_order and assigned custom_order", "maxOrder", maxOrder, "customOrder", customOrder, "trackID", trackID)
 		} else {
 			slog.Debug("[OrganizeSharedTrack] Error getting max order", "error", err)
 		}
 	}
 
 	slog.Debug("[OrganizeSharedTrack] Upserting track", "trackID", trackID, "folderID", folderID, "customOrder", customOrder)
-	org, err := h.db.UpsertSharedTrackOrganization(r.Context(), sqlc.UpsertSharedTrackOrganizationParams{
+	org, err := h.svc.UpsertSharedTrackOrganization(r.Context(), sqlc.UpsertSharedTrackOrganizationParams{
 		UserID:      int64(userID),
 		TrackID:     trackID,
 		FolderID:    folderID,
@@ -260,7 +234,7 @@ func (h *OrganizationHandler) BulkOrganize(w http.ResponseWriter, r *http.Reques
 				if item.FolderID != nil {
 					folderID = sql.NullInt64{Int64: *item.FolderID, Valid: true}
 				}
-				_, err := h.db.UpsertSharedProjectOrganization(ctx, sqlc.UpsertSharedProjectOrganizationParams{
+				_, err := h.svc.UpsertSharedProjectOrganization(ctx, sqlc.UpsertSharedProjectOrganizationParams{
 					UserID:      int64(userID),
 					ProjectID:   item.ID,
 					FolderID:    folderID,
@@ -270,7 +244,7 @@ func (h *OrganizationHandler) BulkOrganize(w http.ResponseWriter, r *http.Reques
 					return apperr.NewInternal("failed to organize shared project", err)
 				}
 			} else {
-				_, err := h.db.UpdateProjectCustomOrder(ctx, sqlc.UpdateProjectCustomOrderParams{
+				err := h.svc.UpdateProjectCustomOrder(ctx, sqlc.UpdateProjectCustomOrderParams{
 					CustomOrder: item.CustomOrder,
 					ID:          item.ID,
 					UserID:      int64(userID),
@@ -285,7 +259,7 @@ func (h *OrganizationHandler) BulkOrganize(w http.ResponseWriter, r *http.Reques
 				if item.FolderID != nil {
 					folderID = sql.NullInt64{Int64: *item.FolderID, Valid: true}
 				}
-				_, err := h.db.UpsertSharedTrackOrganization(ctx, sqlc.UpsertSharedTrackOrganizationParams{
+				_, err := h.svc.UpsertSharedTrackOrganization(ctx, sqlc.UpsertSharedTrackOrganizationParams{
 					UserID:      int64(userID),
 					TrackID:     item.ID,
 					FolderID:    folderID,

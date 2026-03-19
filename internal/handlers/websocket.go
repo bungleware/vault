@@ -1,9 +1,11 @@
 package handlers
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -13,13 +15,23 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		// TODO: adjust, allow all origins in development
-		return true
-	},
+func newUpgrader(allowedOrigins []string) websocket.Upgrader {
+	return websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				return true
+			}
+			for _, allowed := range allowedOrigins {
+				if origin == allowed {
+					return true
+				}
+			}
+			return false
+		},
+	}
 }
 
 type WSMessage struct {
@@ -52,7 +64,7 @@ func (h *WSHub) Register(userID int64, conn *websocket.Conn) {
 		h.connections[userID] = make(map[*websocket.Conn]bool)
 	}
 	h.connections[userID][conn] = true
-	log.Printf("[WebSocket] User %d connected (total connections: %d)", userID, len(h.connections[userID]))
+	slog.Info("WebSocket user connected", "user_id", userID, "connections", len(h.connections[userID]))
 }
 
 func (h *WSHub) Unregister(userID int64, conn *websocket.Conn) {
@@ -64,7 +76,7 @@ func (h *WSHub) Unregister(userID int64, conn *websocket.Conn) {
 		if len(conns) == 0 {
 			delete(h.connections, userID)
 		}
-		log.Printf("[WebSocket] User %d disconnected", userID)
+		slog.Info("WebSocket user disconnected", "user_id", userID)
 	}
 }
 
@@ -74,24 +86,24 @@ func (h *WSHub) SendToUser(userID int64, msg WSMessage) {
 	h.mu.RUnlock()
 
 	if conns == nil {
-		log.Printf("[WebSocket] No connections for user %d, message not sent", userID)
+		slog.Debug("WebSocket no connections for user", "user_id", userID)
 		return
 	}
 
 	data, err := json.Marshal(msg)
 	if err != nil {
-		log.Printf("[WebSocket] Failed to marshal message: %v", err)
+		slog.Error("WebSocket failed to marshal message", "error", err)
 		return
 	}
 
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	log.Printf("[WebSocket] Sending message to user %d (%d connections): %s", userID, len(conns), string(data))
+	slog.Debug("WebSocket sending message", "user_id", userID, "connections", len(conns))
 
 	for conn := range conns {
 		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
-			log.Printf("[WebSocket] Failed to send message: %v", err)
+			slog.Error("WebSocket failed to send message", "error", err)
 			// Don't remove here - let the read loop handle disconnection
 		}
 	}
@@ -113,11 +125,12 @@ func (h *WSHub) NotifyTranscodingUpdate(userID int64, trackPublicID string, vers
 }
 
 type WebSocketHandler struct {
-	hub *WSHub
+	hub      *WSHub
+	upgrader websocket.Upgrader
 }
 
-func NewWebSocketHandler(hub *WSHub) *WebSocketHandler {
-	return &WebSocketHandler{hub: hub}
+func NewWebSocketHandler(hub *WSHub, allowedOrigins []string) *WebSocketHandler {
+	return &WebSocketHandler{hub: hub, upgrader: newUpgrader(allowedOrigins)}
 }
 
 func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Request) {
@@ -127,9 +140,9 @@ func (h *WebSocketHandler) HandleConnection(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("[WebSocket] Failed to upgrade connection: %v", err)
+		slog.Error("WebSocket failed to upgrade connection", "error", err)
 		return
 	}
 
@@ -148,7 +161,7 @@ func (h *WebSocketHandler) handleConnection(userID int64, conn *websocket.Conn) 
 		_, _, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("[WebSocket] Unexpected close error: %v", err)
+				slog.Error("WebSocket unexpected close error", "error", err)
 			}
 			break
 		}
@@ -287,11 +300,12 @@ func (h *CollaborationHub) BroadcastUpdate(roomID string, updateType string, dat
 }
 
 type CollaborationWebSocketHandler struct {
-	hub *CollaborationHub
+	hub      *CollaborationHub
+	upgrader websocket.Upgrader
 }
 
-func NewCollaborationWebSocketHandler(hub *CollaborationHub) *CollaborationWebSocketHandler {
-	return &CollaborationWebSocketHandler{hub: hub}
+func NewCollaborationWebSocketHandler(hub *CollaborationHub, allowedOrigins []string) *CollaborationWebSocketHandler {
+	return &CollaborationWebSocketHandler{hub: hub, upgrader: newUpgrader(allowedOrigins)}
 }
 
 func (h *CollaborationWebSocketHandler) HandleCollaboration(w http.ResponseWriter, r *http.Request) {
@@ -312,9 +326,9 @@ func (h *CollaborationWebSocketHandler) HandleCollaboration(w http.ResponseWrite
 
 	roomID := resourceType + ":" + resourceID
 
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("[Collaboration] Failed to upgrade connection: %v", err)
+		slog.Error("Collaboration failed to upgrade connection", "error", err)
 		return
 	}
 
@@ -344,7 +358,7 @@ func (c *CollaborationClient) readPump() {
 		err := c.Conn.ReadJSON(&msg)
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("[Collaboration] Unexpected close error: %v", err)
+				slog.Error("Collaboration unexpected close error", "error", err)
 			}
 			break
 		}
@@ -363,12 +377,16 @@ func (c *CollaborationClient) writePump() {
 	for msg := range c.Send {
 		err := c.Conn.WriteJSON(msg)
 		if err != nil {
-			log.Printf("[Collaboration] Failed to write message: %v", err)
+			slog.Error("Collaboration failed to write message", "error", err)
 			break
 		}
 	}
 }
 
 func generateSessionID() string {
-	return fmt.Sprintf("%d", time.Now().UnixNano())
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }

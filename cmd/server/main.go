@@ -34,6 +34,7 @@ type Config struct {
 	DataDir            string
 	AuthConfig         auth.Config
 	CORSAllowedOrigins []string
+	PublicBaseURL      string
 }
 
 func loadConfig() Config {
@@ -74,7 +75,8 @@ func loadConfig() Config {
 
 	tokenPepper := os.Getenv("TOKEN_PEPPER")
 	if tokenPepper == "" {
-		slog.Warn("TOKEN_PEPPER is not set; refresh/reset tokens are hashed without a pepper")
+		slog.Error("TOKEN_PEPPER is not set; refresh/reset tokens are hashed without a pepper")
+		os.Exit(1)
 	}
 
 	return Config{
@@ -92,6 +94,7 @@ func loadConfig() Config {
 			CookieSameSite:      cookieSameSite,
 		},
 		CORSAllowedOrigins: parseCommaEnv("CORS_ALLOWED_ORIGINS"),
+		PublicBaseURL:      os.Getenv("PUBLIC_BASE_URL"),
 	}
 }
 
@@ -193,6 +196,10 @@ func main() {
 		"data_dir", config.DataDir,
 	)
 
+	if config.PublicBaseURL == "" {
+		slog.Warn("PUBLIC_BASE_URL is not set; share URLs will be built from the request Host header, which is attacker-controlled")
+	}
+
 	database, err := db.New(db.Config{
 		DataDir:        config.DataDir,
 		DBFile:         "vault.db",
@@ -206,7 +213,7 @@ func main() {
 	slog.Info("Database initialized successfully")
 
 	wsHub := handlers.NewWSHub()
-	wsHandler := handlers.NewWebSocketHandler(wsHub)
+	wsHandler := handlers.NewWebSocketHandler(wsHub, config.CORSAllowedOrigins)
 
 	// WORKERS
 	transcoder := transcoding.NewTranscoder(database, 2)
@@ -216,7 +223,7 @@ func main() {
 	slog.Info("Transcoding system initialized", "workers", 2)
 
 	storageAdapter := storage.NewFilesystemStorage(config.DataDir)
-	svc := service.NewService(database, storageAdapter)
+	svc := service.NewService(database, storageAdapter, config.AuthConfig)
 
 	go func() {
 		slog.Info("Starting cover migration for existing projects")
@@ -227,24 +234,22 @@ func main() {
 		}
 	}()
 
-	authService := service.NewAuthService(database, config.AuthConfig)
-
-	authHandler := handlers.NewAuthHandler(authService, config.AuthConfig)
-	adminHandler := handlers.NewAdminHandler(database, config.AuthConfig)
-	prefsHandler := handlers.NewPreferencesHandler(database)
-	statsHandler := handlers.NewStatsHandler(database, Version, CommitSHA)
-	instanceHandler := handlers.NewInstanceHandler(database, config.DataDir, wsHub)
+	authHandler := handlers.NewAuthHandler(svc.Auth, config.AuthConfig)
+	adminHandler := handlers.NewAdminHandler(svc.Admin)
+	prefsHandler := handlers.NewPreferencesHandler(svc.Preferences)
+	statsHandler := handlers.NewStatsHandler(svc.Stats, Version, CommitSHA)
+	instanceHandler := handlers.NewInstanceHandler(svc.Instance, config.DataDir, wsHub)
 	mediaHandler := handlers.NewMediaHandler(config.AuthConfig)
 	projectsHandler := projects.NewProjectsHandler(svc.Projects, database, config.DataDir)
-	foldersHandler := handlers.NewFoldersHandler(database)
-	tracksHandler := tracks.NewTracksHandler(database, storageAdapter, transcoder)
-	versionsHandler := handlers.NewVersionsHandler(database, storageAdapter, transcoder)
-	streamingHandler := handlers.NewStreamingHandler(database)
-	sharingHandler := sharing.NewSharingHandler(database, storageAdapter)
+	foldersHandler := handlers.NewFoldersHandler(svc.Folders)
+	tracksHandler := tracks.NewTracksHandler(svc.Tracks, transcoder)
+	versionsHandler := handlers.NewVersionsHandler(svc.Versions, svc.Tracks, storageAdapter, transcoder)
+	streamingHandler := handlers.NewStreamingHandler(svc.Tracks)
+	sharingHandler := sharing.NewSharingHandler(svc.Sharing, storageAdapter, config.PublicBaseURL, config.DataDir)
 	collaborationHub := handlers.NewCollaborationHub()
-	collaborationHandler := handlers.NewCollaborationWebSocketHandler(collaborationHub)
-	notesHandler := handlers.NewNotesHandler(database)
-	organizationHandler := handlers.NewOrganizationHandler(database)
+	collaborationHandler := handlers.NewCollaborationWebSocketHandler(collaborationHub, config.CORSAllowedOrigins)
+	notesHandler := handlers.NewNotesHandler(svc.Notes, svc.Tracks)
+	organizationHandler := handlers.NewOrganizationHandler(svc.Organization)
 
 	mux := http.NewServeMux()
 
@@ -281,43 +286,32 @@ func main() {
 	})
 
 	sessionValidator := func(userID int, issuedAt time.Time) bool {
-		ctx := context.Background()
-		result, err := database.Queries.GetSessionInvalidatedAt(ctx)
-		if err != nil || !result.Valid {
-			// continue
-		} else if !issuedAt.After(result.Time) {
-			return false
-		}
-
-		userInvalidated, err := database.Queries.GetUserSessionInvalidatedAt(ctx, int64(userID))
-		if err != nil || !userInvalidated.Valid {
-			return true
-		}
-		return issuedAt.After(userInvalidated.Time)
+		return svc.Auth.ValidateSession(context.Background(), userID, issuedAt)
 	}
 
 	authMW := middleware.AuthMiddleware(config.AuthConfig.JWTSecret, sessionValidator)
 	optionalAuthMW := middleware.OptionalAuthMiddleware(config.AuthConfig.JWTSecret, sessionValidator)
 	signedURLMW := middleware.SignedURLMiddleware(config.AuthConfig.SignedURLSecret, 30*time.Second)
+	adminMW := middleware.AdminMiddleware(database.Queries)
 
 	mux.Handle("GET /api/auth/me", authMW(httputil.Wrap(authHandler.Me)))
 	mux.Handle("PUT /api/auth/username", authMW(httputil.Wrap(authHandler.UpdateUsername)))
 	mux.Handle("DELETE /api/auth/me", authMW(httputil.Wrap(authHandler.DeleteSelf)))
 	mux.Handle("POST /api/auth/logout", authMW(httputil.Wrap(authHandler.Logout)))
 
-	mux.Handle("GET /api/users", authMW(httputil.Wrap(adminHandler.ListAllUsersPublic)))
+	mux.Handle("GET /api/users", authMW(adminMW(httputil.Wrap(adminHandler.ListAllUsersPublic))))
 
-	mux.Handle("GET /api/admin/users", authMW(httputil.Wrap(adminHandler.ListUsers)))
-	mux.Handle("POST /api/admin/users/invite", authMW(httputil.Wrap(adminHandler.CreateInvite)))
-	mux.Handle("PUT /api/admin/users/{id}/role", authMW(httputil.Wrap(adminHandler.UpdateUserRole)))
-	mux.Handle("PUT /api/admin/users/{id}/rename", authMW(httputil.Wrap(adminHandler.RenameUser)))
-	mux.Handle("DELETE /api/admin/users/{id}", authMW(httputil.Wrap(adminHandler.DeleteUser)))
-	mux.Handle("POST /api/admin/users/{id}/reset-link", authMW(httputil.Wrap(adminHandler.CreateResetLink)))
+	mux.Handle("GET /api/admin/users", authMW(adminMW(httputil.Wrap(adminHandler.ListUsers))))
+	mux.Handle("POST /api/admin/users/invite", authMW(adminMW(httputil.Wrap(adminHandler.CreateInvite))))
+	mux.Handle("PUT /api/admin/users/{id}/role", authMW(adminMW(httputil.Wrap(adminHandler.UpdateUserRole))))
+	mux.Handle("PUT /api/admin/users/{id}/rename", authMW(adminMW(httputil.Wrap(adminHandler.RenameUser))))
+	mux.Handle("DELETE /api/admin/users/{id}", authMW(adminMW(httputil.Wrap(adminHandler.DeleteUser))))
+	mux.Handle("POST /api/admin/users/{id}/reset-link", authMW(adminMW(httputil.Wrap(adminHandler.CreateResetLink))))
 
-	mux.Handle("GET /api/admin/instance/export/size", authMW(httputil.Wrap(instanceHandler.GetExportSize)))
-	mux.Handle("GET /api/admin/instance/export", authMW(httputil.Wrap(instanceHandler.ExportInstance)))
-	mux.Handle("POST /api/admin/instance/import", authMW(httputil.Wrap(instanceHandler.ImportInstance)))
-	mux.Handle("POST /api/admin/instance/reset", authMW(httputil.Wrap(instanceHandler.ResetInstance)))
+	mux.Handle("GET /api/admin/instance/export/size", authMW(adminMW(httputil.Wrap(instanceHandler.GetExportSize))))
+	mux.Handle("GET /api/admin/instance/export", authMW(adminMW(httputil.Wrap(instanceHandler.ExportInstance))))
+	mux.Handle("POST /api/admin/instance/import", authMW(adminMW(httputil.Wrap(instanceHandler.ImportInstance))))
+	mux.Handle("POST /api/admin/instance/reset", authMW(adminMW(httputil.Wrap(instanceHandler.ResetInstance))))
 
 	mux.Handle("GET /api/preferences", authMW(httputil.Wrap(prefsHandler.GetPreferences)))
 	mux.Handle("PUT /api/preferences", authMW(httputil.Wrap(prefsHandler.UpdatePreferences)))
@@ -325,7 +319,7 @@ func main() {
 	mux.Handle("GET /api/stats/storage", authMW(httputil.Wrap(statsHandler.GetStorageStats)))
 	mux.Handle("GET /api/stats/storage/global", authMW(httputil.Wrap(statsHandler.GetGlobalStorageStats)))
 	mux.Handle("GET /api/instance", authMW(httputil.Wrap(statsHandler.GetInstanceInfo)))
-	mux.Handle("PUT /api/instance/name", authMW(httputil.Wrap(statsHandler.UpdateInstanceName)))
+	mux.Handle("PUT /api/instance/name", authMW(adminMW(httputil.Wrap(statsHandler.UpdateInstanceName))))
 
 	mux.Handle("POST /api/projects", authMW(httputil.Wrap(projectsHandler.CreateProject)))
 	mux.Handle("GET /api/projects", authMW(httputil.Wrap(projectsHandler.ListProjects)))
@@ -425,8 +419,16 @@ func main() {
 			"/api/auth/validate-invite-token",
 			"/api/auth/validate-reset-token",
 			"/api/auth/check-users",
-			"/api/share/",
 			"/api/health",
+		},
+		// Exempt only the unauthenticated share-token track update endpoint.
+		// All other /api/share/ mutating endpoints require user auth and must stay CSRF-protected.
+		ExemptFuncs: []func(r *http.Request) bool{
+			func(r *http.Request) bool {
+				return strings.HasPrefix(r.URL.Path, "/api/share/") &&
+					strings.Contains(r.URL.Path, "/track/") &&
+					strings.HasSuffix(r.URL.Path, "/update")
+			},
 		},
 	})
 
@@ -438,7 +440,7 @@ func main() {
 		Addr:         fmt.Sprintf(":%s", config.Port),
 		Handler:      handler,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 0,
+		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -19,6 +20,7 @@ var (
 	ErrTokenUsed          = errors.New("token already used")
 	ErrTokenExpired       = errors.New("token expired")
 	ErrInvalidTokenType   = errors.New("invalid token type")
+	ErrRegistrationClosed = errors.New("registration is closed; use an invite link")
 )
 
 type AuthService interface {
@@ -45,6 +47,9 @@ type AuthService interface {
 	ResetPassword(ctx context.Context, token, newPassword string) error
 
 	GetInviteToken(ctx context.Context, token string) (*InviteToken, error)
+
+	// ValidateSession checks whether a JWT (identified by userID + issuedAt) is still valid.
+	ValidateSession(ctx context.Context, userID int, issuedAt time.Time) bool
 }
 
 type authService struct {
@@ -131,6 +136,9 @@ func (s *authService) Register(ctx context.Context, input RegisterInput) (*Regis
 		return nil, err
 	}
 	isFirstUser := userCount == 0
+	if !isFirstUser {
+		return nil, ErrRegistrationClosed
+	}
 
 	user, err := qtx.CreateUser(ctx, sqlc.CreateUserParams{
 		Username:     input.Username,
@@ -477,8 +485,13 @@ func (s *authService) RefreshSession(ctx context.Context, refreshToken string, m
 		return nil, ErrTokenExpired
 	}
 
-	_ = s.db.Queries.UpdateRefreshTokenLastUsed(ctx, stored.ID)
-	_ = s.db.Queries.RevokeRefreshToken(ctx, stored.ID)
+	if err := s.db.Queries.UpdateRefreshTokenLastUsed(ctx, stored.ID); err != nil {
+		slog.Error("failed to update refresh token last used", "error", err, "tokenID", stored.ID)
+	}
+	if err := s.db.Queries.RevokeRefreshToken(ctx, stored.ID); err != nil {
+		slog.Error("failed to revoke refresh token", "error", err, "tokenID", stored.ID)
+		return nil, fmt.Errorf("failed to revoke refresh token: %w", err)
+	}
 
 	user, err := s.db.Queries.GetUserByID(ctx, stored.UserID)
 	if err != nil {
@@ -583,4 +596,17 @@ func isUniqueConstraintError(err error) bool {
 }
 func (s *authService) VerifyCredentials(ctx context.Context, username, password string) (*User, error) {
 	return s.Login(ctx, username, password)
+}
+
+func (s *authService) ValidateSession(ctx context.Context, userID int, issuedAt time.Time) bool {
+	result, err := s.db.Queries.GetSessionInvalidatedAt(ctx)
+	if err == nil && result.Valid && !issuedAt.After(result.Time) {
+		return false
+	}
+
+	userInvalidated, err := s.db.Queries.GetUserSessionInvalidatedAt(ctx, int64(userID))
+	if err != nil || !userInvalidated.Valid {
+		return true
+	}
+	return issuedAt.After(userInvalidated.Time)
 }

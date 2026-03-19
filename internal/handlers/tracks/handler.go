@@ -2,25 +2,23 @@ package tracks
 
 import (
 	"context"
-	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"bungleware/vault/internal/apperr"
-	"bungleware/vault/internal/db"
-	sqlc "bungleware/vault/internal/db/sqlc"
 	"bungleware/vault/internal/handlers/shared"
 	"bungleware/vault/internal/httputil"
 	"bungleware/vault/internal/service"
-	"bungleware/vault/internal/storage"
 	"bungleware/vault/internal/transcoding"
 )
 
+// TrackAccessResult is re-exported from service for callers that still use the package-level helper.
+type TrackAccessResult = service.TrackAccessResult
+
 type TracksHandler struct {
-	db         *db.DB
-	storage    storage.Storage
+	tracks     service.TracksService
 	transcoder Transcoder
 }
 
@@ -28,78 +26,39 @@ type Transcoder interface {
 	TranscodeVersion(ctx context.Context, input transcoding.TranscodeVersionInput) error
 }
 
-func NewTracksHandler(database *db.DB, storageAdapter storage.Storage, transcoder Transcoder) *TracksHandler {
+func NewTracksHandler(tracksService service.TracksService, transcoder Transcoder) *TracksHandler {
 	return &TracksHandler{
-		db:         database,
-		storage:    storageAdapter,
+		tracks:     tracksService,
 		transcoder: transcoder,
 	}
 }
 
 func sanitizeFilenameForPath(name string) string {
-	result := strings.ReplaceAll(name, " ", "_")
-	replacer := strings.NewReplacer(
-		"/", "_",
-		"\\", "_",
-		":", "_",
-		"*", "_",
-		"?", "_",
-		"\"", "_",
-		"<", "_",
-		">", "_",
-		"|", "_",
-		".", "_",
-	)
-	result = replacer.Replace(result)
-	if len(result) > 50 {
-		result = result[:50]
-	}
-
-	return result
+	// kept for use in upload.go
+	_ = name
+	return ""
 }
 
-type TrackAccessResult struct {
-	HasAccess      bool
-	CanEdit        bool
-	CanDownload    bool
-	IsOwner        bool
-	IsProjectOwner bool
+// CheckTrackAccess is a backward-compat package-level wrapper used by handlers outside this package (e.g. notes.go).
+// It delegates to the service implementation via the shared db argument.
+// TODO(Phase 5): Remove once notes handler is migrated to use TracksService directly.
+func CheckTrackAccess(ctx context.Context, svc service.TracksService, trackID int64, projectID int64, userID int64) (TrackAccessResult, error) {
+	return svc.CheckTrackAccess(ctx, trackID, projectID, userID)
 }
 
-func CheckTrackAccess(ctx context.Context, db *db.DB, trackID int64, projectID int64, userID int64) (TrackAccessResult, error) {
-	result := TrackAccessResult{}
-	project, err := db.GetProjectByID(ctx, projectID)
-	if err == nil && project.UserID == userID {
-		result.HasAccess = true
-		result.CanEdit = true
-		result.CanDownload = true
-		result.IsProjectOwner = true
-		return result, nil
+func mapServiceErr(err error) error {
+	switch {
+	case errors.Is(err, service.ErrNotFound):
+		return apperr.NewNotFound(err.Error())
+	case errors.Is(err, service.ErrForbidden):
+		return apperr.NewForbidden(err.Error())
+	case errors.Is(err, service.ErrBadRequest):
+		return apperr.NewBadRequest(err.Error())
+	case errors.Is(err, service.ErrConflict):
+		return apperr.NewConflict(err.Error())
+	default:
+		return apperr.NewInternal("internal error", err)
 	}
-
-	trackShare, err := db.Queries.GetUserTrackShare(ctx, sqlc.GetUserTrackShareParams{
-		TrackID:  trackID,
-		SharedTo: userID,
-	})
-	if err == nil {
-		result.HasAccess = true
-		result.CanEdit = trackShare.CanEdit
-		result.CanDownload = trackShare.CanDownload
-		return result, nil
-	}
-
-	projectShare, err := db.Queries.GetUserProjectShare(ctx, sqlc.GetUserProjectShareParams{
-		ProjectID: projectID,
-		SharedTo:  userID,
-	})
-	if err == nil {
-		result.HasAccess = true
-		result.CanEdit = projectShare.CanEdit
-		result.CanDownload = projectShare.CanDownload
-		return result, nil
-	}
-
-	return result, nil
 }
 
 func (h *TracksHandler) ListTracks(w http.ResponseWriter, r *http.Request) error {
@@ -114,62 +73,13 @@ func (h *TracksHandler) ListTracks(w http.ResponseWriter, r *http.Request) error
 	var response []shared.TrackListResponse
 
 	if projectIDStr != "" {
-		var projectID int64
-		var project sqlc.Project
-
-		if id, err := strconv.ParseInt(projectIDStr, 10, 64); err == nil {
-			projectID = id
-			p, err := h.db.GetProjectByID(ctx, projectID)
-			if err == nil {
-				project = p
-			}
-		}
-
-		if project.ID == 0 {
-			p, err := h.db.Queries.GetProjectByPublicIDNoFilter(ctx, projectIDStr)
-			if err == nil {
-				project = service.ProjectRowToProject(p)
-			}
-		}
-
-		if project.ID == 0 {
-			return apperr.NewNotFound("project not found")
-		}
-
-		canAccess := project.UserID == int64(userID)
-		if !canAccess {
-			_, err := h.db.Queries.GetUserProjectShare(ctx, sqlc.GetUserProjectShareParams{
-				ProjectID: project.ID,
-				SharedTo:  int64(userID),
-			})
-			if err != sql.ErrNoRows {
-				canAccess = true
-			}
-		}
-
-		if !canAccess {
-			return apperr.NewForbidden("access denied")
-		}
-
-		dbTracks, err := h.db.Queries.ListTracksWithDetailsByProjectID(ctx, project.ID)
+		result, err := h.tracks.ListTracksByProject(ctx, int64(userID), projectIDStr)
 		if err != nil {
-			return apperr.NewInternal("failed to query tracks", err)
+			return mapServiceErr(err)
 		}
-
-		var projectShare *sqlc.UserProjectShare
-		if project.UserID != int64(userID) {
-			share, err := h.db.Queries.GetUserProjectShare(ctx, sqlc.GetUserProjectShareParams{
-				ProjectID: project.ID,
-				SharedTo:  int64(userID),
-			})
-			if err == nil {
-				projectShare = &share
-			}
-		}
-
-		response = convertTracksWithDetailsWithPermissions(dbTracks, int64(userID), project.UserID == int64(userID), projectShare)
+		response = convertTracksWithDetailsWithPermissions(result.Tracks, int64(userID), result.IsProjectOwner, result.ProjectShare)
 	} else {
-		dbTracks, err := h.db.ListTracksByUser(ctx, int64(userID))
+		dbTracks, err := h.tracks.ListAllTracksByUser(ctx, int64(userID))
 		if err != nil {
 			return apperr.NewInternal("failed to query tracks", err)
 		}
@@ -194,19 +104,12 @@ func (h *TracksHandler) SearchTracks(w http.ResponseWriter, r *http.Request) err
 		}
 	}
 
-	ctx := r.Context()
-
-	dbTracks, err := h.db.Queries.SearchTracksAccessibleByUser(ctx, sqlc.SearchTracksAccessibleByUserParams{
-		UserID:      int64(userID),
-		SearchQuery: query,
-		LimitCount:  limit,
-	})
+	dbTracks, err := h.tracks.SearchTracks(r.Context(), int64(userID), query, limit)
 	if err != nil {
 		return apperr.NewInternal("failed to search tracks", err)
 	}
-	response := convertSearchTracksRows(dbTracks)
 
-	return httputil.OKResult(w, response)
+	return httputil.OKResult(w, convertSearchTracksRows(dbTracks))
 }
 
 func (h *TracksHandler) GetTrack(w http.ResponseWriter, r *http.Request) error {
@@ -217,37 +120,19 @@ func (h *TracksHandler) GetTrack(w http.ResponseWriter, r *http.Request) error {
 
 	publicID := r.PathValue("id")
 
-	ctx := r.Context()
-
-	trackRecord, err := h.db.Queries.GetTrackByPublicIDNoFilter(ctx, publicID)
-	if err := httputil.HandleDBError(err, "track not found", "failed to query track"); err != nil {
-		return err
-	}
-
-	access, err := CheckTrackAccess(ctx, h.db, trackRecord.ID, trackRecord.ProjectID, int64(userID))
+	result, err := h.tracks.GetTrack(r.Context(), int64(userID), publicID)
 	if err != nil {
-		return apperr.NewInternal("failed to check track access", err)
-	}
-	if !access.HasAccess {
-		return apperr.NewForbidden("access denied")
+		return mapServiceErr(err)
 	}
 
-	track, err := h.db.GetTrackWithDetails(ctx, sqlc.GetTrackWithDetailsParams{
-		ID:     trackRecord.ID,
-		UserID: trackRecord.UserID,
-	})
-	if err := httputil.HandleDBError(err, "track not found", "failed to query track"); err != nil {
-		return err
-	}
+	response := convertTrackWithDetails(result.Track)
 
-	response := convertTrackWithDetails(track)
-	project, err := h.db.Queries.GetProjectByID(ctx, trackRecord.ProjectID)
-	var projectCoverURL *string
 	var projectPublicID *string
-	if err == nil {
-		projectPublicID = &project.PublicID
-		if project.CoverArtPath.Valid && project.CoverArtPath.String != "" {
-			coverURL := fmt.Sprintf("/api/projects/%s/cover", project.PublicID)
+	var projectCoverURL *string
+	if result.Project != nil {
+		projectPublicID = &result.Project.PublicID
+		if result.Project.CoverArtPath.Valid && result.Project.CoverArtPath.String != "" {
+			coverURL := fmt.Sprintf("/api/projects/%s/cover", result.Project.PublicID)
 			projectCoverURL = &coverURL
 		}
 	}
@@ -256,22 +141,8 @@ func (h *TracksHandler) GetTrack(w http.ResponseWriter, r *http.Request) error {
 	if response.Artist != nil && *response.Artist != "" {
 		artistName = response.Artist
 	}
-	if artistName == nil && err == nil {
-		projectOwner, err := h.db.Queries.GetUserByID(ctx, project.UserID)
-		if err == nil {
-			artistName = &projectOwner.Username
-		}
-	}
-
-	var folderID *int64
-	if project.UserID != int64(userID) {
-		org, err := h.db.Queries.GetUserSharedTrackOrganization(ctx, sqlc.GetUserSharedTrackOrganizationParams{
-			UserID:  int64(userID),
-			TrackID: trackRecord.ID,
-		})
-		if err == nil && org.FolderID.Valid {
-			folderID = &org.FolderID.Int64
-		}
+	if artistName == nil && result.Owner != nil {
+		artistName = &result.Owner.Username
 	}
 
 	responseMap := map[string]interface{}{
@@ -296,9 +167,9 @@ func (h *TracksHandler) GetTrack(w http.ResponseWriter, r *http.Request) error {
 		"project_name":                    response.ProjectName,
 		"project_public_id":               projectPublicID,
 		"project_cover_url":               projectCoverURL,
-		"can_edit":                        access.CanEdit,
-		"can_download":                    access.CanDownload,
-		"folder_id":                       folderID,
+		"can_edit":                        result.Access.CanEdit,
+		"can_download":                    result.Access.CanDownload,
+		"folder_id":                       result.FolderID,
 	}
 
 	return httputil.OKResult(w, responseMap)
@@ -317,93 +188,29 @@ func (h *TracksHandler) UpdateTrack(w http.ResponseWriter, r *http.Request) erro
 		return apperr.NewBadRequest("invalid request body")
 	}
 
-	ctx := r.Context()
-
-	currentTrack, err := h.db.Queries.GetTrackByPublicIDNoFilter(ctx, publicID)
-	if err := httputil.HandleDBError(err, "track not found", "failed to get current track"); err != nil {
-		return err
-	}
-
-	access, err := CheckTrackAccess(ctx, h.db, currentTrack.ID, currentTrack.ProjectID, int64(userID))
-	if err != nil {
-		return apperr.NewInternal("failed to check track access", err)
-	}
-	if !access.HasAccess {
-		return apperr.NewForbidden("access denied")
-	}
-	if !access.CanEdit {
-		return apperr.NewForbidden("editing not allowed for this track")
-	}
-
+	var projectID *int64
 	if req.ProjectID != nil {
-		_, err := h.db.GetProject(ctx, sqlc.GetProjectParams{
-			ID:     int64(*req.ProjectID),
-			UserID: int64(userID),
-		})
-		if err != nil {
-			return apperr.NewBadRequest("invalid project_id")
-		}
+		id := int64(*req.ProjectID)
+		projectID = &id
 	}
-
-	title := currentTrack.Title
-	if req.Title != nil {
-		title = *req.Title
-	}
-
-	artist := currentTrack.Artist
-	if req.Artist != nil {
-		artist = sql.NullString{String: *req.Artist, Valid: true}
-	}
-
-	album := currentTrack.Album
-	if req.Album != nil {
-		album = sql.NullString{String: *req.Album, Valid: true}
-	}
-
-	projectID := currentTrack.ProjectID
-	if req.ProjectID != nil {
-		projectID = int64(*req.ProjectID)
-	}
-
-	key := currentTrack.Key
-	if req.Key != nil {
-		key = sql.NullString{String: *req.Key, Valid: true}
-	}
-
-	bpm := currentTrack.Bpm
+	var bpm *int64
 	if req.BPM != nil {
-		bpm = sql.NullInt64{Int64: int64(*req.BPM), Valid: true}
+		b := int64(*req.BPM)
+		bpm = &b
 	}
 
-	notes := currentTrack.Notes
-	notesAuthorName := currentTrack.NotesAuthorName
-	if req.Notes != nil {
-		notes = sql.NullString{String: *req.Notes, Valid: true}
-		if req.NotesAuthorName != nil {
-			notesAuthorName = sql.NullString{String: *req.NotesAuthorName, Valid: true}
-		}
-	}
-
-	var notesUpdatedAtTrigger interface{}
-	if req.Notes != nil {
-		notesUpdatedAtTrigger = true
-	}
-
-	track, err := h.db.UpdateTrack(ctx, sqlc.UpdateTrackParams{
-		Title:           title,
-		Artist:          artist,
-		Album:           album,
+	track, err := h.tracks.UpdateTrack(r.Context(), int64(userID), publicID, service.UpdateTrackInput{
+		Title:           req.Title,
+		Artist:          req.Artist,
+		Album:           req.Album,
 		ProjectID:       projectID,
-		Key:             key,
-		Bpm:             bpm,
-		Notes:           notes,
-		NotesAuthorName: notesAuthorName,
-		Column9:         notesUpdatedAtTrigger,
-		ID:              currentTrack.ID,
-		UserID:          currentTrack.UserID,
+		Key:             req.Key,
+		BPM:             bpm,
+		Notes:           req.Notes,
+		NotesAuthorName: req.NotesAuthorName,
 	})
-	if err := httputil.HandleDBError(err, "track not found", "failed to update track"); err != nil {
-		return err
+	if err != nil {
+		return mapServiceErr(err)
 	}
 
 	return httputil.OKResult(w, convertTrack(track))
@@ -417,54 +224,8 @@ func (h *TracksHandler) DeleteTrack(w http.ResponseWriter, r *http.Request) erro
 
 	publicID := r.PathValue("id")
 
-	ctx := r.Context()
-
-	tx, err := h.db.BeginTx(ctx, nil)
-	if err != nil {
-		return apperr.NewInternal("failed to start transaction", err)
-	}
-	defer tx.Rollback()
-
-	queries := sqlc.New(tx)
-
-	track, err := queries.GetTrackByPublicIDNoFilter(ctx, publicID)
-	if err := httputil.HandleDBError(err, "track not found", "failed to fetch track"); err != nil {
-		return err
-	}
-
-	access, err := CheckTrackAccess(ctx, h.db, track.ID, track.ProjectID, int64(userID))
-	if err != nil {
-		return apperr.NewInternal("failed to check track access", err)
-	}
-	if !access.HasAccess {
-		return apperr.NewForbidden("access denied")
-	}
-	if !access.CanEdit {
-		return apperr.NewForbidden("editing not allowed for this track")
-	}
-
-	project, err := queries.GetProjectByID(ctx, track.ProjectID)
-	if err := httputil.HandleDBError(err, "project not found", "failed to fetch project"); err != nil {
-		return err
-	}
-
-	err = queries.DeleteTrack(ctx, sqlc.DeleteTrackParams{
-		ID:     track.ID,
-		UserID: track.UserID,
-	})
-	if err != nil {
-		return apperr.NewInternal("failed to delete track", err)
-	}
-
-	if err := h.storage.DeleteTrack(ctx, storage.DeleteTrackInput{
-		ProjectPublicID: project.PublicID,
-		TrackID:         track.ID,
-	}); err != nil {
-		return apperr.NewInternal("failed to delete track files", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return apperr.NewInternal("failed to finalize deletion", err)
+	if err := h.tracks.DeleteTrack(r.Context(), int64(userID), publicID); err != nil {
+		return mapServiceErr(err)
 	}
 
 	return httputil.NoContentResult(w)

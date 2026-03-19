@@ -74,31 +74,14 @@ func (rl *IPRateLimiter) cleanupStaleEntries() {
 	}
 }
 
-// extractIP gets the client IP from the request
+// extractIP gets the client IP from the request.
+// We use only RemoteAddr (the actual TCP connection IP) to prevent
+// rate limit bypass via spoofed X-Forwarded-For or X-Real-IP headers.
 func extractIP(r *http.Request) string {
-	// Check X-Forwarded-For header first (for proxies/load balancers)
-	forwarded := r.Header.Get("X-Forwarded-For")
-	if forwarded != "" {
-		// Take the first IP in the list
-		ips := strings.Split(forwarded, ",")
-		if len(ips) > 0 {
-			return strings.TrimSpace(ips[0])
-		}
-	}
-
-	// Check X-Real-IP header
-	realIP := r.Header.Get("X-Real-IP")
-	if realIP != "" {
-		return realIP
-	}
-
-	// Fall back to RemoteAddr
-	// RemoteAddr is in the format "IP:port", so we need to split it
 	ip := r.RemoteAddr
 	if colonIdx := strings.LastIndex(ip, ":"); colonIdx != -1 {
 		ip = ip[:colonIdx]
 	}
-
 	return ip
 }
 

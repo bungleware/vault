@@ -1,22 +1,26 @@
 package sharing
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strconv"
 
 	"bungleware/vault/internal/apperr"
-	sqlc "bungleware/vault/internal/db/sqlc"
 	"bungleware/vault/internal/handlers/shared"
 	"bungleware/vault/internal/httputil"
+	"bungleware/vault/internal/service"
 )
 
 type ShareWithUsersRequest struct {
 	UserIDs     []int64 `json:"user_ids"`
 	CanEdit     bool    `json:"can_edit"`
 	CanDownload bool    `json:"can_download"`
+}
+
+type updateSharePermissionsReq struct {
+	CanEdit     bool `json:"can_edit"`
+	CanDownload bool `json:"can_download"`
 }
 
 func (h *SharingHandler) ShareProjectWithUsers(w http.ResponseWriter, r *http.Request) error {
@@ -29,44 +33,27 @@ func (h *SharingHandler) ShareProjectWithUsers(w http.ResponseWriter, r *http.Re
 		return apperr.NewBadRequest("invalid project id")
 	}
 
-	var req ShareWithUsersRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	req, err := httputil.DecodeJSON[ShareWithUsersRequest](r)
+	if err != nil {
 		return apperr.NewBadRequest("invalid request body")
 	}
-	ctx := r.Context()
 
-	project, err := h.db.Queries.GetProjectByPublicID(ctx, sqlc.GetProjectByPublicIDParams{
-		PublicID: publicID,
-		UserID:   int64(userID),
+	project, successCount, err := h.svc.ShareProjectWithUsers(r.Context(), int64(userID), publicID, service.ShareWithUsersInput{
+		UserIDs:     req.UserIDs,
+		CanEdit:     req.CanEdit,
+		CanDownload: req.CanDownload,
 	})
-	if err := httputil.HandleDBError(err, "project not found", "failed to verify project"); err != nil {
-		return err
-	}
-	if project.UserID != int64(userID) {
-		return apperr.NewForbidden("unauthorized")
-	}
-
-	var successCount int
-	var lastErr error
-	for _, userToShareWithID := range req.UserIDs {
-		_, err := h.db.Queries.CreateUserProjectShare(ctx, sqlc.CreateUserProjectShareParams{
-			ProjectID:   project.ID,
-			SharedBy:    int64(userID),
-			SharedTo:    userToShareWithID,
-			CanEdit:     req.CanEdit,
-			CanDownload: req.CanDownload,
-		})
-		if err != nil {
-			lastErr = err
-			continue
+	if err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return apperr.NewNotFound("project not found")
 		}
-		successCount++
-	}
-	if successCount == 0 {
-		if lastErr != nil {
-			return apperr.NewInternal("failed to share with users", lastErr)
+		if errors.Is(err, service.ErrForbidden) {
+			return apperr.NewForbidden("unauthorized")
 		}
-		return apperr.NewBadRequest("no users were shared with")
+		if errors.Is(err, service.ErrBadRequest) {
+			return apperr.NewBadRequest("no users were shared with")
+		}
+		return apperr.NewInternal("failed to share with users", err)
 	}
 	return httputil.CreatedResult(w, map[string]interface{}{
 		"message": fmt.Sprintf("project shared with %d user(s)", successCount),
@@ -84,48 +71,29 @@ func (h *SharingHandler) ShareTrackWithUsers(w http.ResponseWriter, r *http.Requ
 		return apperr.NewBadRequest("invalid track id")
 	}
 
-	var req ShareWithUsersRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	req, err := httputil.DecodeJSON[ShareWithUsersRequest](r)
+	if err != nil {
 		return apperr.NewBadRequest("invalid request body")
 	}
-	ctx := r.Context()
 
-	track, err := h.db.Queries.GetTrackByPublicIDNoFilter(ctx, publicID)
-	if err := httputil.HandleDBError(err, "track not found", "failed to query track"); err != nil {
-		return err
-	}
-
-	canShare, err := h.canManageTrackShares(ctx, track, int64(userID))
+	track, successCount, err := h.svc.ShareTrackWithUsers(r.Context(), int64(userID), publicID, service.ShareWithUsersInput{
+		UserIDs:     req.UserIDs,
+		CanEdit:     req.CanEdit,
+		CanDownload: req.CanDownload,
+	})
 	if err != nil {
-		return apperr.NewInternal("failed to check permissions", err)
-	}
-	if !canShare {
-		slog.WarnContext(r.Context(), "Share track failed: user does not have permission to manage track shares",
-			"user_id", userID, "track_id", publicID, "track_owner_id", track.UserID, "project_id", track.ProjectID)
-		return apperr.NewForbidden("unauthorized")
-	}
-
-	var successCount int
-	var lastErr error
-	for _, userToShareWithID := range req.UserIDs {
-		_, err := h.db.Queries.CreateUserTrackShare(ctx, sqlc.CreateUserTrackShareParams{
-			TrackID:     track.ID,
-			SharedBy:    int64(userID),
-			SharedTo:    userToShareWithID,
-			CanEdit:     req.CanEdit,
-			CanDownload: req.CanDownload,
-		})
-		if err != nil {
-			lastErr = err
-			continue
+		if errors.Is(err, service.ErrNotFound) {
+			return apperr.NewNotFound("track not found")
 		}
-		successCount++
-	}
-	if successCount == 0 {
-		if lastErr != nil {
-			return apperr.NewInternal("failed to share with users", lastErr)
+		if errors.Is(err, service.ErrForbidden) {
+			slog.WarnContext(r.Context(), "Share track failed: user does not have permission",
+				"user_id", userID, "track_id", publicID)
+			return apperr.NewForbidden("unauthorized")
 		}
-		return apperr.NewBadRequest("no users were shared with")
+		if errors.Is(err, service.ErrBadRequest) {
+			return apperr.NewBadRequest("no users were shared with")
+		}
+		return apperr.NewInternal("failed to share with users", err)
 	}
 	return httputil.CreatedResult(w, map[string]interface{}{
 		"message": fmt.Sprintf("track shared with %d user(s)", successCount),
@@ -138,28 +106,18 @@ func (h *SharingHandler) ListProjectsSharedWithMe(w http.ResponseWriter, r *http
 	if err != nil {
 		return apperr.NewUnauthorized("user not found in context")
 	}
-	ctx := r.Context()
 
-	projects, err := h.db.Queries.ListProjectsSharedWithUser(ctx, int64(userID))
+	projects, err := h.svc.ListProjectsSharedWithMe(r.Context(), int64(userID))
 	if err != nil {
 		return apperr.NewInternal("failed to list shared projects", err)
 	}
 
 	response := make([]shared.ProjectResponse, len(projects))
-	for i, project := range projects {
-		projectResponse := shared.ConvertProject(project)
-		owner, err := h.db.Queries.GetUserByID(ctx, project.UserID)
-		if err == nil {
-			projectResponse.SharedByUsername = &owner.Username
-		}
-		share, err := h.db.Queries.GetUserProjectShare(ctx, sqlc.GetUserProjectShareParams{
-			ProjectID: project.ID,
-			SharedTo:  int64(userID),
-		})
-		if err == nil {
-			projectResponse.AllowEditing = share.CanEdit
-			projectResponse.AllowDownloads = share.CanDownload
-		}
+	for i, info := range projects {
+		projectResponse := shared.ConvertProject(info.Project)
+		projectResponse.SharedByUsername = &info.OwnerUsername
+		projectResponse.AllowEditing = info.AllowEditing
+		projectResponse.AllowDownloads = info.AllowDownloads
 		response[i] = projectResponse
 	}
 	return httputil.OKResult(w, response)
@@ -170,105 +128,30 @@ func (h *SharingHandler) ListTracksSharedWithMe(w http.ResponseWriter, r *http.R
 	if err != nil {
 		return apperr.NewUnauthorized("user not found in context")
 	}
-	ctx := r.Context()
 
-	allTracks, err := h.db.Queries.ListTracksSharedWithUser(ctx, int64(userID))
+	tracks, err := h.svc.ListTracksSharedWithMe(r.Context(), int64(userID))
 	if err != nil {
 		return apperr.NewInternal("failed to list shared tracks", err)
 	}
-	sharedProjects, err := h.db.Queries.ListProjectsSharedWithUser(ctx, int64(userID))
-	if err != nil {
-		return apperr.NewInternal("failed to list shared projects", err)
+
+	result := make([]shared.SharedTrackResponse, len(tracks))
+	for i, t := range tracks {
+		result[i] = shared.SharedTrackResponse{
+			ID:               t.ID,
+			PublicID:         t.PublicID,
+			Title:            t.Title,
+			Artist:           t.Artist,
+			CoverURL:         t.CoverURL,
+			ProjectName:      t.ProjectName,
+			Waveform:         t.Waveform,
+			DurationSeconds:  t.DurationSeconds,
+			SharedByUsername: t.SharedByUsername,
+			CanDownload:      t.CanDownload,
+			FolderID:         t.FolderID,
+			CustomOrder:      t.CustomOrder,
+		}
 	}
-
-	sharedProjectIDs := make(map[int64]bool)
-	for _, project := range sharedProjects {
-		sharedProjectIDs[project.ID] = true
-	}
-
-	enrichedTracks := make([]shared.SharedTrackResponse, 0)
-	for _, track := range allTracks {
-		if sharedProjectIDs[track.ProjectID] {
-			continue
-		}
-		project, err := h.db.Queries.GetProjectByID(ctx, track.ProjectID)
-		if err != nil {
-			continue
-		}
-		shares, err := h.db.ListUsersTrackIsSharedWith(ctx, track.ID)
-		if err != nil || len(shares) == 0 {
-			continue
-		}
-		var shareRecord sqlc.UserTrackShare
-		for _, share := range shares {
-			if share.SharedTo == int64(userID) {
-				shareRecord = share
-				break
-			}
-		}
-
-		sharedByUser, err := h.db.GetUserByID(ctx, shareRecord.SharedBy)
-		if err != nil {
-			continue
-		}
-
-		var waveform string
-		var duration float64
-		if track.ActiveVersionID.Valid {
-			version, err := h.db.GetTrackVersion(ctx, track.ActiveVersionID.Int64)
-			if err == nil && version.DurationSeconds.Valid {
-				duration = version.DurationSeconds.Float64
-				files, err := h.db.ListTrackFilesByVersion(ctx, track.ActiveVersionID.Int64)
-				if err == nil && len(files) > 0 {
-					for _, file := range files {
-						if file.Waveform.Valid && file.Waveform.String != "" {
-							waveform = file.Waveform.String
-							break
-						}
-					}
-				}
-			}
-		}
-
-		coverURL := ""
-		if project.CoverArtPath.Valid && project.CoverArtPath.String != "" {
-			coverURL = fmt.Sprintf("/api/projects/%s/cover", project.PublicID)
-		}
-
-		var folderID *int64
-		var customOrder *int64
-		org, err := h.db.Queries.GetUserSharedTrackOrganization(ctx, sqlc.GetUserSharedTrackOrganizationParams{
-			UserID: int64(userID), TrackID: track.ID,
-		})
-		if err == nil {
-			if org.FolderID.Valid {
-				folderID = &org.FolderID.Int64
-			}
-			customOrder = &org.CustomOrder
-		}
-
-		var artist string
-		if track.Artist.Valid {
-			artist = track.Artist.String
-		}
-
-		enrichedTracks = append(enrichedTracks, shared.SharedTrackResponse{
-			ID:               track.ID,
-			PublicID:         track.PublicID,
-			Title:            track.Title,
-			Artist:           artist,
-			CoverURL:         coverURL,
-			ProjectName:      project.Name,
-			Waveform:         waveform,
-			DurationSeconds:  duration,
-			SharedByUsername: sharedByUser.Username,
-			CanDownload:      shareRecord.CanDownload,
-			FolderID:         folderID,
-			CustomOrder:      customOrder,
-		})
-	}
-
-	return httputil.OKResult(w, enrichedTracks)
+	return httputil.OKResult(w, result)
 }
 
 func (h *SharingHandler) RevokeProjectShare(w http.ResponseWriter, r *http.Request) error {
@@ -280,10 +163,7 @@ func (h *SharingHandler) RevokeProjectShare(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		return err
 	}
-	err = h.db.Queries.DeleteUserProjectShare(r.Context(), sqlc.DeleteUserProjectShareParams{
-		ID: shareID, SharedBy: int64(userID),
-	})
-	if err != nil {
+	if err := h.svc.RevokeProjectShare(r.Context(), int64(userID), shareID); err != nil {
 		return apperr.NewInternal("failed to revoke share", err)
 	}
 	return httputil.NoContentResult(w)
@@ -298,24 +178,13 @@ func (h *SharingHandler) RevokeTrackShare(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		return err
 	}
-
-	ctx := r.Context()
-	share, err := h.db.Queries.GetUserTrackShareByID(ctx, shareID)
-	if err := httputil.HandleDBError(err, "share not found", "failed to query share"); err != nil {
-		return err
-	}
-	track, err := h.db.Queries.GetTrackByID(ctx, share.TrackID)
-	if err != nil {
-		return apperr.NewInternal("failed to query track", err)
-	}
-	canManage, err := h.canManageTrackShares(ctx, track, int64(userID))
-	if err != nil {
-		return apperr.NewInternal("failed to check permissions", err)
-	}
-	if !canManage {
-		return apperr.NewForbidden("unauthorized")
-	}
-	if err := h.db.Queries.DeleteUserTrackShareByShareID(ctx, shareID); err != nil {
+	if err := h.svc.RevokeTrackShare(r.Context(), int64(userID), shareID); err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return apperr.NewNotFound("share not found")
+		}
+		if errors.Is(err, service.ErrForbidden) {
+			return apperr.NewForbidden("unauthorized")
+		}
 		return apperr.NewInternal("failed to revoke share", err)
 	}
 	return httputil.NoContentResult(w)
@@ -330,17 +199,15 @@ func (h *SharingHandler) ListProjectShareUsers(w http.ResponseWriter, r *http.Re
 	if publicID == "" {
 		return apperr.NewBadRequest("invalid project id")
 	}
-	ctx := r.Context()
 
-	project, err := h.db.Queries.GetProjectByPublicIDNoFilter(ctx, publicID)
-	if err := httputil.HandleDBError(err, "project not found", "failed to query project"); err != nil {
-		return err
-	}
-	if project.UserID != int64(userID) {
-		return apperr.NewForbidden("unauthorized")
-	}
-	shares, err := h.db.Queries.ListUsersProjectIsSharedWith(ctx, project.ID)
+	shares, err := h.svc.ListProjectShareUsers(r.Context(), int64(userID), publicID)
 	if err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return apperr.NewNotFound("project not found")
+		}
+		if errors.Is(err, service.ErrForbidden) {
+			return apperr.NewForbidden("unauthorized")
+		}
 		return apperr.NewInternal("failed to list shares", err)
 	}
 	return httputil.OKResult(w, shares)
@@ -355,23 +222,17 @@ func (h *SharingHandler) ListTrackShareUsers(w http.ResponseWriter, r *http.Requ
 	if publicID == "" {
 		return apperr.NewBadRequest("invalid track id")
 	}
-	ctx := r.Context()
 
-	track, err := h.db.Queries.GetTrackByPublicIDNoFilter(ctx, publicID)
-	if err := httputil.HandleDBError(err, "track not found", "failed to query track"); err != nil {
-		return err
-	}
-	canView, err := h.canManageTrackShares(ctx, track, int64(userID))
+	shares, err := h.svc.ListTrackShareUsers(r.Context(), int64(userID), publicID)
 	if err != nil {
-		return apperr.NewInternal("failed to check permissions", err)
-	}
-	if !canView {
-		slog.WarnContext(r.Context(), "List track shares failed: user does not have permission to manage track shares",
-			"user_id", userID, "track_id", publicID, "track_owner_id", track.UserID, "project_id", track.ProjectID)
-		return apperr.NewForbidden("unauthorized")
-	}
-	shares, err := h.db.Queries.ListUsersTrackIsSharedWith(ctx, track.ID)
-	if err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return apperr.NewNotFound("track not found")
+		}
+		if errors.Is(err, service.ErrForbidden) {
+			slog.WarnContext(r.Context(), "List track shares failed: no permission",
+				"user_id", userID, "track_id", publicID)
+			return apperr.NewForbidden("unauthorized")
+		}
 		return apperr.NewInternal("failed to list shares", err)
 	}
 	return httputil.OKResult(w, shares)
@@ -382,25 +243,17 @@ func (h *SharingHandler) UpdateProjectSharePermissions(w http.ResponseWriter, r 
 	if err != nil {
 		return apperr.NewUnauthorized("user not found in context")
 	}
-	shareIDStr := r.PathValue("shareId")
-	if shareIDStr == "" {
-		return apperr.NewBadRequest("invalid share id")
-	}
-	shareID, err := strconv.ParseInt(shareIDStr, 10, 64)
+	shareID, err := httputil.PathInt64(r, "shareId")
 	if err != nil {
 		return apperr.NewBadRequest("invalid share id")
 	}
-	var req struct {
-		CanEdit     bool `json:"can_edit"`
-		CanDownload bool `json:"can_download"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+
+	req, err := httputil.DecodeJSON[updateSharePermissionsReq](r)
+	if err != nil {
 		return apperr.NewBadRequest("invalid request body")
 	}
 
-	share, err := h.db.Queries.UpdateUserProjectShare(r.Context(), sqlc.UpdateUserProjectShareParams{
-		CanEdit: req.CanEdit, CanDownload: req.CanDownload, ID: shareID, SharedBy: int64(userID),
-	})
+	share, err := h.svc.UpdateProjectSharePermissions(r.Context(), int64(userID), shareID, req.CanEdit, req.CanDownload)
 	if err != nil {
 		return apperr.NewInternal("failed to update share", err)
 	}
@@ -412,42 +265,24 @@ func (h *SharingHandler) UpdateTrackSharePermissions(w http.ResponseWriter, r *h
 	if err != nil {
 		return apperr.NewUnauthorized("user not found in context")
 	}
-	shareIDStr := r.PathValue("shareId")
-	if shareIDStr == "" {
-		return apperr.NewBadRequest("invalid share id")
-	}
-	shareID, err := strconv.ParseInt(shareIDStr, 10, 64)
+	shareID, err := httputil.PathInt64(r, "shareId")
 	if err != nil {
 		return apperr.NewBadRequest("invalid share id")
 	}
-	var req struct {
-		CanEdit     bool `json:"can_edit"`
-		CanDownload bool `json:"can_download"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+
+	req, err := httputil.DecodeJSON[updateSharePermissionsReq](r)
+	if err != nil {
 		return apperr.NewBadRequest("invalid request body")
 	}
 
-	ctx := r.Context()
-	existingShare, err := h.db.Queries.GetUserTrackShareByID(ctx, shareID)
-	if err := httputil.HandleDBError(err, "share not found", "failed to query share"); err != nil {
-		return err
-	}
-	track, err := h.db.Queries.GetTrackByID(ctx, existingShare.TrackID)
+	share, err := h.svc.UpdateTrackSharePermissions(r.Context(), int64(userID), shareID, req.CanEdit, req.CanDownload)
 	if err != nil {
-		return apperr.NewInternal("failed to query track", err)
-	}
-	canManage, err := h.canManageTrackShares(ctx, track, int64(userID))
-	if err != nil {
-		return apperr.NewInternal("failed to check permissions", err)
-	}
-	if !canManage {
-		return apperr.NewForbidden("unauthorized")
-	}
-	share, err := h.db.Queries.UpdateUserTrackShareByID(ctx, sqlc.UpdateUserTrackShareByIDParams{
-		CanEdit: req.CanEdit, CanDownload: req.CanDownload, ID: shareID,
-	})
-	if err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return apperr.NewNotFound("share not found")
+		}
+		if errors.Is(err, service.ErrForbidden) {
+			return apperr.NewForbidden("unauthorized")
+		}
 		return apperr.NewInternal("failed to update share", err)
 	}
 	return httputil.OKResult(w, share)

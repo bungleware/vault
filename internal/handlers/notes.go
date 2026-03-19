@@ -6,19 +6,21 @@ import (
 	"net/http"
 
 	"bungleware/vault/internal/apperr"
-	"bungleware/vault/internal/db"
 	sqlc "bungleware/vault/internal/db/sqlc"
 	"bungleware/vault/internal/handlers/tracks"
 	"bungleware/vault/internal/httputil"
+	"bungleware/vault/internal/service"
 )
 
 type NotesHandler struct {
-	db *db.DB
+	notesService  service.NotesService
+	tracksService service.TracksService
 }
 
-func NewNotesHandler(database *db.DB) *NotesHandler {
+func NewNotesHandler(notesService service.NotesService, tracksService service.TracksService) *NotesHandler {
 	return &NotesHandler{
-		db: database,
+		notesService:  notesService,
+		tracksService: tracksService,
 	}
 }
 
@@ -36,12 +38,12 @@ func (h *NotesHandler) GetTrackNotes(w http.ResponseWriter, r *http.Request) err
 
 	ctx := r.Context()
 
-	track, err := h.db.Queries.GetTrackByPublicIDNoFilter(ctx, trackPublicID)
+	track, err := h.notesService.GetTrackByPublicID(ctx, trackPublicID)
 	if err := httputil.HandleDBError(err, "track not found", "failed to get track"); err != nil {
 		return err
 	}
 
-	access, err := tracks.CheckTrackAccess(ctx, h.db, track.ID, track.ProjectID, userID64)
+	access, err := tracks.CheckTrackAccess(ctx, h.tracksService, track.ID, track.ProjectID, userID64)
 	if err != nil {
 		return apperr.NewInternal("failed to check track access", err)
 	}
@@ -49,7 +51,7 @@ func (h *NotesHandler) GetTrackNotes(w http.ResponseWriter, r *http.Request) err
 		return apperr.NewForbidden("access denied")
 	}
 
-	notes, err := h.db.GetNotesByTrack(r.Context(), sql.NullInt64{Int64: track.ID, Valid: true})
+	notes, err := h.notesService.GetTrackNotes(ctx, track.ID)
 	if err != nil {
 		return apperr.NewInternal(err.Error(), err)
 	}
@@ -67,8 +69,7 @@ func (h *NotesHandler) GetTrackNotes(w http.ResponseWriter, r *http.Request) err
 		}
 	}
 
-	httputil.OK(w, response)
-	return nil
+	return httputil.OKResult(w, response)
 }
 
 func (h *NotesHandler) GetProjectNotes(w http.ResponseWriter, r *http.Request) error {
@@ -83,10 +84,7 @@ func (h *NotesHandler) GetProjectNotes(w http.ResponseWriter, r *http.Request) e
 		return apperr.NewBadRequest("project ID is required")
 	}
 
-	project, err := h.db.GetProjectByPublicID(r.Context(), sqlc.GetProjectByPublicIDParams{
-		PublicID: projectPublicID,
-		UserID:   userID64,
-	})
+	project, err := h.notesService.GetProjectByPublicID(r.Context(), projectPublicID, userID64)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return apperr.NewNotFound("project not found")
@@ -94,7 +92,7 @@ func (h *NotesHandler) GetProjectNotes(w http.ResponseWriter, r *http.Request) e
 		return apperr.NewInternal(err.Error(), err)
 	}
 
-	notes, err := h.db.GetNotesByProject(r.Context(), sql.NullInt64{Int64: project.ID, Valid: true})
+	notes, err := h.notesService.GetProjectNotes(r.Context(), project.ID)
 	if err != nil {
 		return apperr.NewInternal(err.Error(), err)
 	}
@@ -112,8 +110,7 @@ func (h *NotesHandler) GetProjectNotes(w http.ResponseWriter, r *http.Request) e
 		}
 	}
 
-	httputil.OK(w, response)
-	return nil
+	return httputil.OKResult(w, response)
 }
 
 func (h *NotesHandler) UpsertTrackNote(w http.ResponseWriter, r *http.Request) error {
@@ -135,12 +132,12 @@ func (h *NotesHandler) UpsertTrackNote(w http.ResponseWriter, r *http.Request) e
 
 	ctx := r.Context()
 
-	track, err := h.db.Queries.GetTrackByPublicIDNoFilter(ctx, trackPublicID)
+	track, err := h.notesService.GetTrackByPublicID(ctx, trackPublicID)
 	if err := httputil.HandleDBError(err, "track not found", "failed to get track"); err != nil {
 		return err
 	}
 
-	access, err := tracks.CheckTrackAccess(ctx, h.db, track.ID, track.ProjectID, userID64)
+	access, err := tracks.CheckTrackAccess(ctx, h.tracksService, track.ID, track.ProjectID, userID64)
 	if err != nil {
 		return apperr.NewInternal("failed to check track access", err)
 	}
@@ -148,7 +145,7 @@ func (h *NotesHandler) UpsertTrackNote(w http.ResponseWriter, r *http.Request) e
 		return apperr.NewForbidden("access denied")
 	}
 
-	note, err := h.db.UpsertTrackNote(r.Context(), sqlc.UpsertTrackNoteParams{
+	note, err := h.notesService.UpsertTrackNote(r.Context(), sqlc.UpsertTrackNoteParams{
 		UserID:     userID64,
 		TrackID:    sql.NullInt64{Int64: track.ID, Valid: true},
 		Content:    req.Content,
@@ -158,7 +155,7 @@ func (h *NotesHandler) UpsertTrackNote(w http.ResponseWriter, r *http.Request) e
 		return apperr.NewInternal(err.Error(), err)
 	}
 
-	response := NoteResponse{
+	return httputil.OKResult(w, NoteResponse{
 		ID:         note.ID,
 		UserID:     note.UserID,
 		Content:    note.Content,
@@ -166,10 +163,7 @@ func (h *NotesHandler) UpsertTrackNote(w http.ResponseWriter, r *http.Request) e
 		CreatedAt:  httputil.FormatNullTimeString(note.CreatedAt),
 		UpdatedAt:  httputil.FormatNullTimeString(note.UpdatedAt),
 		IsOwner:    true,
-	}
-
-	httputil.OK(w, response)
-	return nil
+	})
 }
 
 func (h *NotesHandler) UpsertProjectNote(w http.ResponseWriter, r *http.Request) error {
@@ -189,10 +183,7 @@ func (h *NotesHandler) UpsertProjectNote(w http.ResponseWriter, r *http.Request)
 		return apperr.NewBadRequest("invalid request body")
 	}
 
-	project, err := h.db.GetProjectByPublicID(r.Context(), sqlc.GetProjectByPublicIDParams{
-		PublicID: projectPublicID,
-		UserID:   userID64,
-	})
+	project, err := h.notesService.GetProjectByPublicID(r.Context(), projectPublicID, userID64)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return apperr.NewNotFound("project not found")
@@ -200,7 +191,7 @@ func (h *NotesHandler) UpsertProjectNote(w http.ResponseWriter, r *http.Request)
 		return apperr.NewInternal(err.Error(), err)
 	}
 
-	note, err := h.db.UpsertProjectNote(r.Context(), sqlc.UpsertProjectNoteParams{
+	note, err := h.notesService.UpsertProjectNote(r.Context(), sqlc.UpsertProjectNoteParams{
 		UserID:     userID64,
 		ProjectID:  sql.NullInt64{Int64: project.ID, Valid: true},
 		Content:    req.Content,
@@ -210,7 +201,7 @@ func (h *NotesHandler) UpsertProjectNote(w http.ResponseWriter, r *http.Request)
 		return apperr.NewInternal(err.Error(), err)
 	}
 
-	response := NoteResponse{
+	return httputil.OKResult(w, NoteResponse{
 		ID:         note.ID,
 		UserID:     note.UserID,
 		Content:    note.Content,
@@ -218,10 +209,7 @@ func (h *NotesHandler) UpsertProjectNote(w http.ResponseWriter, r *http.Request)
 		CreatedAt:  httputil.FormatNullTimeString(note.CreatedAt),
 		UpdatedAt:  httputil.FormatNullTimeString(note.UpdatedAt),
 		IsOwner:    true,
-	}
-
-	httputil.OK(w, response)
-	return nil
+	})
 }
 
 func (h *NotesHandler) DeleteNote(w http.ResponseWriter, r *http.Request) error {
@@ -236,14 +224,10 @@ func (h *NotesHandler) DeleteNote(w http.ResponseWriter, r *http.Request) error 
 		return err
 	}
 
-	err = h.db.DeleteNote(r.Context(), sqlc.DeleteNoteParams{
-		ID:     noteID,
-		UserID: userID64,
-	})
+	err = h.notesService.DeleteNote(r.Context(), noteID, userID64)
 	if err != nil {
 		return apperr.NewInternal(err.Error(), err)
 	}
 
-	httputil.NoContent(w)
-	return nil
+	return httputil.NoContentResult(w)
 }

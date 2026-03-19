@@ -304,6 +304,11 @@ func (s *FilesystemStorage) resolveSourcePath(input OpenProjectCoverInput) strin
 			path = filepath.Join(s.baseDir, path)
 		}
 	}
+	// Containment check: reject any path (including absolute) that escapes baseDir
+	rel, err := filepath.Rel(s.baseDir, filepath.Clean(path))
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return ""
+	}
 	if _, err := os.Stat(path); err != nil {
 		return ""
 	}

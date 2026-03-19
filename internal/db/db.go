@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -123,6 +124,19 @@ func (db *DB) runMigrations(migrationsPath string) error {
 
 func (db *DB) Close() error {
 	return db.DB.Close()
+}
+
+// WithTx runs fn inside a transaction. Rolls back automatically on error.
+func (db *DB) WithTx(ctx context.Context, fn func(*sqlc.Queries) error) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fn(sqlc.New(tx)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (db *DB) ForceCheckpoint() error {

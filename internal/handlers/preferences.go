@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"bungleware/vault/internal/apperr"
-	"bungleware/vault/internal/db"
 	sqlc "bungleware/vault/internal/db/sqlc"
 	"bungleware/vault/internal/httputil"
+	"bungleware/vault/internal/service"
 )
 
 type PreferencesResponse struct {
@@ -24,11 +24,11 @@ type PreferencesResponse struct {
 }
 
 type PreferencesHandler struct {
-	db *db.DB
+	svc service.PreferencesService
 }
 
-func NewPreferencesHandler(database *db.DB) *PreferencesHandler {
-	return &PreferencesHandler{db: database}
+func NewPreferencesHandler(svc service.PreferencesService) *PreferencesHandler {
+	return &PreferencesHandler{svc: svc}
 }
 
 func toPreferencesResponse(prefs sqlc.UserPreference) PreferencesResponse {
@@ -70,16 +70,12 @@ func (h *PreferencesHandler) GetPreferences(w http.ResponseWriter, r *http.Reque
 		return apperr.NewUnauthorized("unauthorized")
 	}
 
-	ctx := r.Context()
-
-	prefs, err := h.db.GetUserPreferences(ctx, int64(userID))
+	prefs, err := h.svc.GetUserPreferences(r.Context(), int64(userID))
 	if err := httputil.HandleDBError(err, "preferences not found", "failed to get preferences"); err != nil {
 		return err
 	}
 
-	resp := toPreferencesResponse(prefs)
-
-	return httputil.OKResult(w, resp)
+	return httputil.OKResult(w, toPreferencesResponse(prefs))
 }
 
 func (h *PreferencesHandler) UpdatePreferences(w http.ResponseWriter, r *http.Request) error {
@@ -100,8 +96,6 @@ func (h *PreferencesHandler) UpdatePreferences(w http.ResponseWriter, r *http.Re
 			return apperr.NewBadRequest("invalid quality value")
 		}
 	}
-
-	ctx := r.Context()
 
 	params := sqlc.UpdateUserPreferencesParams{
 		UserID: int64(userID),
@@ -131,12 +125,10 @@ func (h *PreferencesHandler) UpdatePreferences(w http.ResponseWriter, r *http.Re
 		params.ColorShiftRotation = sql.NullInt64{Int64: int64(*req.ColorShiftRotation), Valid: true}
 	}
 
-	prefs, err := h.db.UpdateUserPreferences(ctx, params)
+	prefs, err := h.svc.UpdateUserPreferences(r.Context(), params)
 	if err != nil {
 		return apperr.NewInternal("failed to update preferences", err)
 	}
 
-	resp := toPreferencesResponse(prefs)
-
-	return httputil.OKResult(w, resp)
+	return httputil.OKResult(w, toPreferencesResponse(prefs))
 }

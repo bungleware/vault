@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"net"
 	"net/http"
+	"unicode"
 
 	"bungleware/vault/internal/apperr"
 	"bungleware/vault/internal/auth"
@@ -21,6 +22,27 @@ func NewAuthHandler(authService authsvc.AuthService, authConfig auth.Config) *Au
 		authService: authService,
 		authConfig:  authConfig,
 	}
+}
+
+func validatePasswordComplexity(password string) error {
+	if len(password) < 8 {
+		return apperr.NewBadRequest("password must be at least 8 characters")
+	}
+	var hasUpper, hasLower, hasDigit bool
+	for _, c := range password {
+		switch {
+		case unicode.IsUpper(c):
+			hasUpper = true
+		case unicode.IsLower(c):
+			hasLower = true
+		case unicode.IsDigit(c):
+			hasDigit = true
+		}
+	}
+	if !hasUpper || !hasLower || !hasDigit {
+		return apperr.NewBadRequest("password must contain at least one uppercase letter, one lowercase letter, and one digit")
+	}
+	return nil
 }
 
 func mapAuthError(err error) error {
@@ -41,6 +63,8 @@ func mapAuthError(err error) error {
 		return apperr.NewUnauthorized("token expired")
 	case authsvc.ErrInvalidTokenType:
 		return apperr.NewUnauthorized("invalid token type")
+	case authsvc.ErrRegistrationClosed:
+		return apperr.NewForbidden("registration is closed; use an invite link")
 	default:
 		return apperr.NewInternal("authentication error", err)
 	}
@@ -54,6 +78,10 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) error {
 
 	if req.Username == "" || req.Email == "" || req.Password == "" {
 		return apperr.NewBadRequest("username, email, and password are required")
+	}
+
+	if err := validatePasswordComplexity(req.Password); err != nil {
+		return err
 	}
 
 	result, err := h.authService.Register(r.Context(), authsvc.RegisterInput{
@@ -171,6 +199,10 @@ func (h *AuthHandler) RegisterWithInvite(w http.ResponseWriter, r *http.Request)
 		return apperr.NewBadRequest("username, password, and invite_token are required")
 	}
 
+	if err := validatePasswordComplexity(req.Password); err != nil {
+		return err
+	}
+
 	result, err := h.authService.RegisterWithInvite(r.Context(), authsvc.RegisterWithInviteInput{
 		Username:    req.Username,
 		Email:       req.Email,
@@ -202,6 +234,10 @@ func (h *AuthHandler) ResetPassword(w http.ResponseWriter, r *http.Request) erro
 
 	if req.Password == "" || req.ResetToken == "" {
 		return apperr.NewBadRequest("password and reset_token are required")
+	}
+
+	if err := validatePasswordComplexity(req.Password); err != nil {
+		return err
 	}
 
 	if err := h.authService.ResetPassword(r.Context(), req.ResetToken, req.Password); err != nil {
