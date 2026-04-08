@@ -14,6 +14,7 @@ Store, share, and version your audio projects.
 <details>
   <summary>More screenshots</summary>
   <img width="1252" height="896" alt="tracks" src="docs/tracks.webp" />
+  <img width="3850" height="2478" alt="image" src="https://github.com/user-attachments/assets/771abad3-c890-4b7c-a839-1c4a1b3e2150" />
   <img width="1624" height="1056" alt="sharing" src="docs/sharing.webp" />
   <img width="1624" height="1056" alt="versions" src="docs/versions.webp" />
   <img width="1624" height="1056" alt="search" src="docs/search.webp" />
